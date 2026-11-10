@@ -1,0 +1,26 @@
+--- a/liveMedia/StreamReplicator.cpp
++++ b/liveMedia/StreamReplicator.cpp
+@@ -19,6 +19,11 @@
+ // Implementation.
+ 
+ #include "StreamReplicator.hh"
++
++// 加固(P13)：取证钩子，由应用层 rRTSPServer.cpp 提供。
++// 每当 copyReceivedFrame() 因目标副本缓冲不足而静默截断时上报一次，
++// 用于现场直接证明「零截断」，而不是只靠 IDR 大小间接推断。
++extern "C" void rrtspReplicaTruncNotify(unsigned frameSize, unsigned maxSize);
+ 
+ ////////// Definition of "StreamReplica": The class that implements each stream replica //////////
+ 
+@@ -324,6 +329,11 @@
+   // First, figure out how much data to copy.  ("toReplica" might have a smaller buffer than "fromReplica".)
+   unsigned numNewBytesToTruncate
+     = toReplica->fMaxSize < fromReplica->fFrameSize ? fromReplica->fFrameSize - toReplica->fMaxSize : 0;
++  // 加固(P13)：任何一次静默截断都上报。P12(4096B 读块) + P13(parser bank
++  // 恒留 >=8192B 空间) 之后这里应当永远不触发；若仍触发，日志里会直接计数。
++  if (numNewBytesToTruncate > 0) {
++    rrtspReplicaTruncNotify(fromReplica->fFrameSize, toReplica->fMaxSize);
++  }
+   toReplica->fFrameSize = fromReplica->fFrameSize - numNewBytesToTruncate;
+   toReplica->fNumTruncatedBytes = fromReplica->fNumTruncatedBytes + numNewBytesToTruncate;
+ 

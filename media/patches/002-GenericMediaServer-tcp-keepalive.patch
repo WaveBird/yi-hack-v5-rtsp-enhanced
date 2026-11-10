@@ -1,0 +1,32 @@
+--- a/liveMedia/GenericMediaServer.cpp
++++ b/liveMedia/GenericMediaServer.cpp
+@@ -21,6 +21,7 @@
+ 
+ #include "GenericMediaServer.hh"
+ #include <GroupsockHelper.hh>
++#include <netinet/tcp.h>
+ #if defined(__WIN32__) || defined(_WIN32) || defined(_QNX4)
+ #define snprintf _snprintf
+ #endif
+@@ -242,6 +243,21 @@
+   ignoreSigPipeOnSocket(clientSocket); // so that clients on the same host that are killed don't also kill us
+   makeSocketNonBlocking(clientSocket);
+   increaseSendBufferTo(envir(), clientSocket, 50*1024);
++
++  // 加固(P3)：启用 TCP keepalive 收割半开连接。
++  // 场景：客户端(经 WiFi)异常消失且无 FIN/RST 时，旧会话永久存活并因
++  // reuseFirstSource 被新客户端复用 —— 这是数据面楔死无法自愈的根源之一。
++  // 30s 空闲后每 5s 探测 1 次、3 次无响应即断开（≈45s 判死）。
++  {
++    int ka = 1;
++    setsockopt(clientSocket, SOL_SOCKET, SO_KEEPALIVE, (const char*)&ka, sizeof ka);
++#ifdef TCP_KEEPIDLE
++    int keepIdle = 30, keepIntvl = 5, keepCnt = 3;
++    setsockopt(clientSocket, IPPROTO_TCP, TCP_KEEPIDLE, (const char*)&keepIdle, sizeof keepIdle);
++    setsockopt(clientSocket, IPPROTO_TCP, TCP_KEEPINTVL, (const char*)&keepIntvl, sizeof keepIntvl);
++    setsockopt(clientSocket, IPPROTO_TCP, TCP_KEEPCNT, (const char*)&keepCnt, sizeof keepCnt);
++#endif
++  }
+   
+ #ifdef DEBUG
+   envir() << "accept()ed connection from " << AddressString(clientAddr).val() << "\n";

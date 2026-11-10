@@ -1,0 +1,89 @@
+--- a/liveMedia/RTPInterface.cpp
++++ b/liveMedia/RTPInterface.cpp
+@@ -23,6 +23,7 @@
+ #include "RTPInterface.hh"
+ #include <GroupsockHelper.hh>
+ #include <stdio.h>
++#include <sys/socket.h> // 加固(P5)：shutdown() / SHUT_RDWR
+ 
+ ////////// Helper Functions - Definition //////////
+ 
+@@ -357,6 +358,13 @@
+     framingHeader[1] = streamChannelId;
+     framingHeader[2] = (u_int8_t) ((packetSize&0xFF00)>>8);
+     framingHeader[3] = (u_int8_t) (packetSize&0xFF);
++    // 加固(P6)：P5b 假设已证伪，回滚为上游原始语义 False。
++    // P5b 曾假设「帧头 EAGAIN 丢整包 -> I 帧残缺 -> 绿屏」，把这里改成 True。
++    // 现场 A/B：P5 版 31/32 段 31 errors / 795 frames = 3.90%，
++    // P5b 版 37/38 段 40 errors / 1050 frames = 3.81%，几乎无改善。
++    // 直连相机重组裸流同样稳定出现 bytestream 错误，且裸流开头 15 个
++    // P slice 在首个 SPS/PPS/IDR 之前 —— 绿屏来自「新会话从 GOP 中间起播」
++    // 与频繁断链，不是这个 4 字节帧头。不要把未证实的假设固化进代码。
+     if (!sendDataOverTCP(socketNum, tlsState, framingHeader, 4, False)) break;
+ 
+     if (!sendDataOverTCP(socketNum, tlsState, packet, packetSize, True)) break;
+@@ -374,8 +382,20 @@
+ }
+ 
+ #ifndef RTPINTERFACE_BLOCKING_WRITE_TIMEOUT_MS
+-#define RTPINTERFACE_BLOCKING_WRITE_TIMEOUT_MS 500
+-#endif
++// 加固(P6)：把 P5 的 200ms 放宽到 1000ms（上游原值 500ms）。
++// P5 的有效修复是「失败时 shutdown 干净断链」，不是「缩短死等」。
++// 200ms 在相机 Wi-Fi 上排不空瞬时拥塞的 TCP 发送缓冲，导致每一次
++// 瞬时 EAGAIN 都变成断链：00:20-00:58 UTC 共 32 次，00:25 那 5 分钟
++// 就有 11 次（正是用户报告绿屏的时段）。每次重连的新会话都从 GOP
++// 中间起播，前约 15 个 P slice 无参考帧，解码 concealment 渲染为
++// 下半幅竖向拉丝 / 播放器里的绿块。
++// 1000ms 让绝大多数瞬时拥塞在阻塞重试中排空；只有真正楔死的连接
++// 才走到下面的 shutdown()。事件循环最坏多停 1s，P4v2 兜底仍在。
++#define RTPINTERFACE_BLOCKING_WRITE_TIMEOUT_MS 1000
++#endif
++
++// 加固(P5)：取证钩子，由应用层 rRTSPServer.cpp 提供（用 open/write 写日志，不用 stdio）。
++extern "C" void rrtspTcpFailureNotify(int socketNum, int reason, unsigned sendResult);
+ 
+ Boolean RTPInterface::sendDataOverTCP(int socketNum, TLSState* tlsState,
+ 				      u_int8_t const* data, unsigned dataSize,
+@@ -401,22 +421,31 @@
+ 	: send(socketNum, (char const*)(&data[numBytesSentSoFar]), numBytesRemainingToSend, 0/*flags*/);
+       makeSocketNonBlocking(socketNum);
+       if ((unsigned)sendResult != numBytesRemainingToSend) {
+-	// The blocking "send()" failed, or timed out.  In either case, we assume that the
+-	// TCP connection has failed (or is 'hanging' indefinitely), and we stop using it
+-	// (for both RTP and RTP).
+-	// (If we kept using the socket here, the RTP or RTCP packet write would be in an
+-	//  incomplete, inconsistent state.)
+-#ifdef DEBUG_SEND
+-	fprintf(stderr, "sendDataOverTCP: blocking send() failed (delivering %d bytes out of %d); closing socket %d\n", sendResult, numBytesRemainingToSend, socketNum); fflush(stderr);
+-#endif
++	// 加固(P5) 根因修复：
++	// 原版在这里只调用 removeStreamSocket(socketNum, 0xFF) —— 它把该 socket 上的
++	// 全部 RTP/RTCP 通道映射摘掉，却把 RTSP TCP 连接本身留在事件循环里。
++	// 于是控制面还活着、数据面永远发不出去，形成「假成功黑流」；同一连接上的
++	// 音频通道仍在，出口约 7KB/s，正好是现场取证到的渗漏态。
++	// 客户端只能等自己的读超时（go2rtc #timeout=4）才重连，P4v2 还要再等 3s
++	// 才拆会话，两段延迟叠加成 8s 左右的物理无画面窗口。
++	//
++	// 修复：先 shutdown(SHUT_RDWR)。对端立刻收到 FIN 并重连；本端后续
++	// readSocket() 因 bytesRead==0 返回 -1，SocketDescriptor 走 fReadErrorOccurred
++	// 的正常删除路径，RTSPClientSession 随之关闭 socket —— 不再是「摘通道留 TCP」。
++	//
++	// 注意：不能改成「丢掉这个包继续」。4 字节 interleaved 帧头已经发出，
++	// 丢弃 payload 会让客户端把下一帧的帧头误当成 payload，TCP 流彻底错位。
++	rrtspTcpFailureNotify(socketNum, 1, (unsigned)sendResult);
++	shutdown(socketNum, SHUT_RDWR);
+ 	removeStreamSocket(socketNum, 0xFF);
+ 	return False;
+       }
+ 
+       return True;
+     } else if (sendResult < 0 && envir().getErrno() != EAGAIN) {
+-      // Because the "send()" call failed, assume that the socket is now unusable, so stop
+-      // using it (for both RTP and RTCP):
++      // Hard error: 同样走干净断链，避免留下半死不活的 TCP 连接。
++      rrtspTcpFailureNotify(socketNum, 2, 0);
++      shutdown(socketNum, SHUT_RDWR);
+       removeStreamSocket(socketNum, 0xFF);
+     }
+ 

@@ -1,0 +1,241 @@
+--- a/src/rRTSPServer.cpp
++++ b/src/rRTSPServer.cpp
+@@ -30,16 +30,179 @@
+ #include <getopt.h>
+ #include <errno.h>
+ #include <limits.h>
++#include <signal.h>
++#include <unistd.h>
++#include <string.h>
++#include <sys/ucontext.h>
+ 
++// ===== 加固(P4v2b)：崩溃现场记录器 =====
++static void hardenedLog(const char* fmt, ...); // 定义在下方 P4v2 块
++static void hardenedCrashHandler(int sig, siginfo_t* info, void* ctx) {
++    u_int32_t pc = 0, addr = (u_int32_t)(uintptr_t)info->si_addr;
++    if (ctx != NULL) {
++        ucontext_t* uc = (ucontext_t*)ctx;
++        pc = uc->uc_mcontext.arm_pc;
++    }
++    hardenedLog("CRASH: signal=%d si_addr=0x%08x pc=0x%08x", sig, addr, pc);
++    _exit(128 + sig);
++}
++// ===== 加固(P4v2b) 结束 =====
++
+ #define RESOLUTION_NONE 0
+ #define RESOLUTION_LOW  360
+ #define RESOLUTION_HIGH 1080
+ #define RESOLUTION_BOTH 1440
+ 
+ int debug = 0;
++
++// ===== 加固(P4b)：TCP 发送失败 fail-fast 拆除楔死会话 =====
++// 根因（见 work/case-rrtsp/ANALYSIS.md）：live555 服务端从不注册 onSendErrorFunc，
++// 发送 EAGAIN 被静默吞掉 → 视频 sink 无限拉帧-丢弃空转，会话永不拆除。
++extern void (*gRTPSendErrorHook)(void);
++static RTSPServer* g_rtspServer = NULL;
++static ServerMediaSession* g_smsHigh = NULL;
++static ServerMediaSession* g_smsLow = NULL;
++
++static void teardownWedgedSessionsTask(void* /*clientData*/) {
++    if (g_rtspServer == NULL) return;
++    hardenedLog("P4b: tearing down wedged sessions");
++    if (g_smsHigh != NULL) g_rtspServer->closeAllClientSessionsForServerMediaSession(g_smsHigh);
++    if (g_smsLow != NULL) g_rtspServer->closeAllClientSessionsForServerMediaSession(g_smsLow);
++    hardenedLog("P4b: teardown done");
++}
++
++static void rtpSendErrorHook(); // 定义在 env 声明之后（内部要用 env）
++
++// ===== 加固(P4v2)：视频 FIFO 无消费超时自动拆除楔死会话 =====
++// 判据（源自 2026-11-07 03:24 UTC 塌陷取证）：楔死可发生在任何一层（EAGAIN 挂起、
++// socket 摘除后未拆除、sink 停止调度），但其共同外显是「有客户端在播（referenceCount>0）
++// 而视频 FIFO 长时间无帧被读出」。视频 20fps 正常时每秒至少读 20 次，10s 无读取即楔死。
++// 动作：拆除该会话全部 client sessions（等价于看门狗 kill 的效果，但无需 kill 进程），
++// FIFO 读端随之关闭、grabber 解除 pipe_write 阻塞；go2rtc 10s 超时重连后完全重建。
++#include <sys/time.h>
++#include <stdarg.h>
++#include <fcntl.h> // O_WRONLY (P4v2 日志)
++extern UsageEnvironment* env; // 定义在下方（P4v2 任务需提前引用）
++u_int64_t gLastVideoReadMs = 0; // 视频源最近一次读到帧的时刻（ByteStreamFifoSource 更新）
++
++static void hardenedLog(const char* fmt, ...) {
++    // 低频事件日志写 RAM（/tmp），避免伤 SD 卡。
++    // 用 open/write 而非 stdio：内存紧张时 fopen 的缓冲分配会静默失败。
++    static int logFd = -1;
++    if (logFd < 0) {
++        logFd = open("/tmp/rrtsp_hardened.log", O_WRONLY | O_APPEND | O_CREAT, 0644);
++        if (logFd < 0) return;
++    }
++    char buf[256];
++    struct timeval tv; gettimeofday(&tv, NULL);
++    struct tm tmv; localtime_r(&tv.tv_sec, &tmv);
++    int n = snprintf(buf, sizeof(buf),
++                     "%04d-%02d-%02d %02d:%02d:%02d ",
++                     tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
++                     tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
++    va_list ap; va_start(ap, fmt);
++    n += vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
++    va_end(ap);
++    if (n > 0 && n < (int)sizeof(buf)) {
++        buf[n++] = '\n';
++        if (write(logFd, buf, n) < 0 && (errno == EBADF || errno == EIO)) logFd = -1;
++    }
++}
++
++static u_int64_t hardenedNowMs() {
++    struct timeval tv; gettimeofday(&tv, NULL);
++    return (u_int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
++}
++
++#define VIDEO_STALL_TEARDOWN_MS 4000    // 连续 4 轮(4s)都出现新的发送失败即判楔死
++                                        // （取证证实：楔死时 FIFO 仍被读取、帧被拉出后发送失败丢弃，
++                                        //   故判据是「发送持续失败」而非「FIFO 无读」）
++#define HEALTH_CHECK_INTERVAL_MS 1000   // 巡检周期
++
++// RTP 发送失败打点（MultiFramedRTPSink 失败分支调用）
++volatile unsigned gRTPSendFailCount = 0;
++void rtpSendFailNotify(void) { gRTPSendFailCount++; }
++
++static void healthCheckTask(void* /*clientData*/);
++static void scheduleHealthCheck() {
++    env->taskScheduler().scheduleDelayedTask(
++        HEALTH_CHECK_INTERVAL_MS * 1000, (TaskFunc*)healthCheckTask, NULL);
++}
++
++static void healthCheckTask(void* /*clientData*/) {
++    // 最终判据（v3，多轮取证后定稿）：客户端停读时 wlan0 出口立刻塌（TCP 窗口归零），
++    // 而内核缓冲可吸收 10-15s、sink 可能停止拉帧 —— tx_queue/EAGAIN 打点均滞后或失效。
++    // 故直接测 wlan0 出口速率：有客户端在播但出口 <15KB/s 连续 3 轮(3s) = 渗漏/塌陷态
++    // （正常 118-147KB/s，静态低码率 ~25KB/s，渗漏态 ~7KB/s，真塌 <1KB/s）→ 拆除重建。
++    // 3s 判定 + ~5s 重建 ≈ 8s 断流窗口，远短于 wd_stream strike4（20s）+killall 路径。
++    static unsigned lastTx = 0;
++    static int lowRounds = 0;
++    if (g_rtspServer == NULL || g_smsHigh == NULL) { scheduleHealthCheck(); return; }
++
++    if (g_smsHigh->referenceCount() > 0) {
++        unsigned tx = 0;
++        int fd = open("/proc/net/dev", O_RDONLY);
++        if (fd >= 0) {
++            char buf[4096];
++            int n = read(fd, buf, sizeof(buf) - 1);
++            close(fd);
++            if (n > 0) {
++                buf[n] = '\0';
++                char* p = strstr(buf, "wlan0");
++                if (p != NULL) sscanf(p, "wlan0:%*u %*u %*u %*u %*u %*u %*u %*u %u", &tx);
++            }
++        }
++        if (lastTx != 0 && tx >= lastTx) {
++            unsigned delta = tx - lastTx; // 1s 内 wlan0 出口字节
++            if (delta < 15 * 1024) {
++                lowRounds++;
++                // 拆除冷却：密集渗漏时段重建出的新会话可能立刻又渗漏，
++                // 连拆会把多个 8-10s 窗口拼成 20-40s 的长断流（15:06 CST 实测）。
++                // 拆除后 20s 内不再拆，给新会话建立与客户端 probe 留时间。
++                if (lowRounds >= 3) {
++                    static time_t lastTeardown = 0;
++                    time_t nowSec = time(NULL);
++                    if (lastTeardown != 0 && nowSec - lastTeardown < 20) {
++                        hardenedLog("egress %u B/s but cooldown active; skipping teardown", delta);
++                        lowRounds = 2; // 保持待命，冷却期一过即可再拆
++                    } else {
++                        hardenedLog("egress %u B/s with %u client(s); tearing down sessions",
++                                    delta, g_smsHigh->referenceCount());
++                        if (g_smsHigh != NULL) g_rtspServer->closeAllClientSessionsForServerMediaSession(g_smsHigh);
++                        if (g_smsLow != NULL) g_rtspServer->closeAllClientSessionsForServerMediaSession(g_smsLow);
++                        lastTeardown = nowSec;
++                        lowRounds = 0;
++                        lastTx = 0;
++                        scheduleHealthCheck();
++                        return;
++                    }
++                }
++            } else {
++                if (lowRounds >= 2)
++                    hardenedLog("egress recovered after %d low round(s)", lowRounds);
++                lowRounds = 0;
++            }
++        }
++        lastTx = tx;
++    } else {
++        lowRounds = 0;
++        lastTx = 0;
++    }
++    scheduleHealthCheck();
++}
++// ===== 加固(P4v2) 结束 =====
++// ===== 加固（全局部分）结束 =====
+ 
+ UsageEnvironment* env;
+ 
++// ===== 加固(P4b)：钩子实现（需在 env 声明之后）=====
++static void rtpSendErrorHook() {
++    hardenedLog("P4b: send error hook triggered");
++    // 不在发送调用栈内同步删除会话（避免 use-after-free），
++    // 调度零延迟任务，由事件循环在当前事件结束后执行。
++    env->taskScheduler().scheduleDelayedTask(0, (TaskFunc*)teardownWedgedSessionsTask, NULL);
++}
++
+ // To make the second and subsequent client for each stream reuse the same
+ // input stream as the first client (rather than playing the file from the
+ // start for each client), change the following "False" to "True":
+@@ -105,6 +268,23 @@
+ 
+ int main(int argc, char** argv)
+ {
++    // 加固(P4v2b)：忽略 SIGPIPE。拆除/收割会话会主动 close 客户端 socket，
++    // 若不忽略，之后对该 fd 的任何写入（RTSP 响应/RTCP）会以 SIGPIPE 直接杀死进程。
++    // 这是原代码的隐藏缺陷：原版从不主动关连接所以从未暴露。
++    signal(SIGPIPE, SIG_IGN);
++
++    // 加固(P4v2b)：崩溃现场记录器——把致命信号地址/PC 写入 RAM 日志，供本地符号化定位
++    {
++        struct sigaction sa;
++        memset(&sa, 0, sizeof(sa));
++        sa.sa_sigaction = hardenedCrashHandler;
++        sa.sa_flags = SA_SIGINFO;
++        sigaction(SIGSEGV, &sa, NULL);
++        sigaction(SIGBUS,  &sa, NULL);
++        sigaction(SIGILL,  &sa, NULL);
++        sigaction(SIGABRT, &sa, NULL);
++    }
++
+     char *str;
+     int nm;
+     char user[65];
+@@ -339,6 +519,7 @@
+                                        ::createNew(*env, replicator, reuseFirstSource));
+         }
+         rtspServer->addServerMediaSession(sms_high);
++        g_smsHigh = sms_high; // 加固(P4b)
+ 
+         announceStream(rtspServer, sms_high, streamName, inputFileName, audio);
+     }
+@@ -359,6 +540,7 @@
+                                         ::createNew(*env, replicator, reuseFirstSource));
+         }
+         rtspServer->addServerMediaSession(sms_low);
++        g_smsLow = sms_low; // 加固(P4b)
+ 
+         announceStream(rtspServer, sms_low, streamName, inputFileName, audio);
+     }
+@@ -390,6 +572,18 @@
+         *env << "\n(RTSP-over-HTTP tunneling is not available.)\n";
+     }
+ */
++    // 加固(P4b)：注册全局发送失败钩子
++    // 【P4v2c 起停用】发送失败（EAGAIN blocking 超时）在瞬时抖动时也会发生，
++    // 立即拆除全部会话过于激进且引发重建风暴；「持续楔死」的拆除统一由
++    // P4v2 巡检（FIFO 10s 无读取）触发，判据更准。teardownWedgedSessionsTask
++    // 与钩子代码保留备用。
++    g_rtspServer = rtspServer;
++    /* gRTPSendErrorHook = rtpSendErrorHook; */
++
++    // 加固(P4v2)：启动 FIFO 无消费巡检
++    hardenedLog("hardened rRTSPServer starting (P1/P3/P4/P4v2), pid=%d, sigpipe=ignored", getpid());
++    scheduleHealthCheck();
++
+     env->taskScheduler().doEventLoop(); // does not return
+ 
+     return 0; // only to prevent compiler warning

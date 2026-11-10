@@ -1,0 +1,129 @@
+MD5 (prebuilt/h264grabber.hardened)                 = 8205cd1c0617f1fc389c85990039d704
+MD5 (prebuilt/h264grabber.p9-v0.4.0-rc)             = 144ec858d80701d1ad139365bbefbfac
+MD5 (prebuilt/rRTSPServer.hardened)                 = 9e3ad7d291d709566f96f01a89d31bed
+MD5 (prebuilt/rRTSPServer.p11-v0.4.0-rc)            = 4c7b6444ec776e3841c5c6adb3174a2d
+MD5 (prebuilt/rRTSPServer.p12-v0.4.0-rc)            = b7c0afee62f977e6db10894a584e3aa0
+MD5 (prebuilt/rRTSPServer.p13-v0.4.0)               = ec2f8a7c578f9ebf5460b3ad22f082fe
+MD5 (prebuilt/rRTSPServer.p18-v0.5.0)               = e9c170c991fbaf6238434ab0d138b9c1
+MD5 (prebuilt/rRTSPServer.p2-persistent-replicator) = ba81109b36973c1c5d3d84223c57dee2
+MD5 (prebuilt/rRTSPServer.p4v2-cooling)             = d40bf3c13d6efb8f561befe497a64990
+MD5 (prebuilt/rRTSPServer.p6-v0.3.0)                = 3d4daceece0782b52bcfb83943ad2b5e
+MD5 (prebuilt/rRTSPServer.p7-v0.4.0-rc)             = c836eb1910fc3398880b56d7672c9eaf
+MD5 (prebuilt/rRTSPServer.stock)                    = d3cde331322b257bdec02b9590739b1e
+
+# rRTSPServer.hardened (155196 B, v0.5.1, CURRENT)
+#   live555 2023.01.19 + yi-hack-v5 0.4.1 + patches 001-015.
+#
+#   P18b (v0.5.1)：在 P18 基础上修正「拥塞丢帧的位置」，见 patches/015
+#   和 docs/FINDINGS.md。
+#     * P18 的 rrtspOutqDropOldest() 丢弃「已入队的最老帧」，只保证队首
+#       是完整 NAL 起点，并不保证落在 IDR；丢掉 IDR/P 参考帧、或把已
+#       发出的 FU-A 前片与队列中剩余片拆开，都会触发解码 concealment
+#       花屏 / 拉丝。该函数自 P18b 起不再被调用（保留作设计对照）。
+#     * P18b 改为「只丢后续新帧直到下一个 SPS/PPS/IDR」：队列装不下时
+#       进入 dropUntilIdr 状态，已入队数据一字节不动，靠 drain 自然排空；
+#       音视频一起丢，保证 P15 的 setts/asetpts 双 CFR 相位不漂移。
+#       遇到 IDR/SPS/PPS 恢复入队（rrtspOutqIsKeyframePacket() 只在视频
+#       RTP 通道 ch=0 上判定，避免 AAC payload 被误判成 IDR），2s 超时
+#       是 GOP 异常长时的防冻结保底。客户端只会跳过一段完整帧并从
+#       关键帧干净重同步 —— 不缺参考帧、不收半个 NAL、不断链。
+#     * 新增 P18b ENTER/EXIT 取证日志（"connection kept"）。
+#
+#   P18 (v0.5.0)：相机侧「拥塞丢帧不断链」根治，见 docs/FINDINGS.md P18 条目。
+#     * RTPInterface 输出队列 192KB -> 512KB；改为按整帧发送（frameOff
+#       记住部分写位置，head 恒对齐 4B 帧头），EAGAIN 后重发不重复字节。
+#     * 队列满时 rrtspOutqDropOldest() 按 interleaved 帧边界丢弃最老的
+#       整帧，并让保留队首落在完整 NAL 起点（rrtspOutqIsNalStart()
+#       识别 FU-A 的 S 位）——只丢完整 NAL，不产生半帧 / 残缺 NAL / 绿屏。
+#     * 取消所有「队列满 / 拥塞 6s」主动 shutdown；仅 send() 硬错误，
+#       或连续 30s 一个字节都没发出去，才走 P5 干净断链。
+#     * P4v2 静态低码率误判收紧：出口阈值 15KB/s -> 1KB/s、
+#       判定 3 轮 -> 15 轮、拆除冷却 20s -> 60s。
+#     * 新增 P18 丢帧取证钩子（每秒节流一行，日志 "connection kept"）。
+#   背景：P14b/P15/P16/P17 四轮消费端时间戳补丁都在替「相机主动断链」
+#   擦屁股。2026-11-08 11:38-11:49 UTC 生产证据：P11 队列 192KB 满
+#   -> P5 shutdown -> go2rtc 重连 -> Frigate watchdog 重启 -> 短秒断流；
+#   P17 更出现音轨相位漂移 56.57s / 容器膨胀到 67s。详见
+#   docs/FINDINGS.md（P17 证伪条目）。
+#   验收口径：允许丢帧，不允许短秒断流。生产侧 P15 的
+#   -bsf:v setts=pts=N/(20*TB) 会把「实际送达包数」重写为 20fps CFR，
+#   因此少量丢帧表现为跳过数帧，而不是秒级时间空洞。
+#
+# rRTSPServer.p18-v0.5.0 (155324 B, v0.5.0)
+#   P18b 之前的生产版本（patches 001-014），一步回滚目标。
+#   30 分钟生产验收 12:44:38..13:14:41 UTC：零断链、零分段缺失、
+#   28 个抽样段 dur=8.96..10.50s、a_first<=0.058s；见
+#   docs/FINDINGS.md（P18 验收条目）。
+#
+# rRTSPServer.p13-v0.4.0 (154068 B, v0.4.0)
+#   P18 之前的生产版本（patches 001-013），两步回滚目标。
+#   deploy.sh 另会在相机上保留 rRTSPServer.predeploy.<timestamp>。
+#
+#   v0.4.0 明细（P1..P7 见下方 v0.3.0 条目；v0.4.0 新增）：
+#   P7  : sendmsg() 原子提交 4B interleaved 帧头 + RTP payload；EAGAIN 整包
+#         丢弃但保持 TCP 流对齐，部分写必须阻塞补完。现场复核：EAGAIN 路径
+#         0 次命中，send() 几乎总是部分写，故被 P11 取代。
+#   P9  : h264grabber 写 FIFO 改裸 fd write_all() 循环（处理短写/EINTR）；
+#         修掉 unlock_fifo_thread() 从码流开头偷走 1024B 的缺陷。
+#   P11 : RTPInterface 用户态非阻塞发送队列，整帧入队、MSG_DONTWAIT 排空，
+#         瞬时拥塞只让帧晚到几十毫秒，不丢字节、不断链、不触发客户端重连。
+#   P11a: SO_SNDBUF 50KB -> 512KB，并把 net.core.wmem_max 160KB -> 1MB，
+#         否则内核会把 512KB 静默截断回 160KB（仅约 1.2s 码率）。
+#   P11b: 诊断镜像按 PID 分文件，避免 high/AUDIO 两个 grabber 互相覆盖。
+#   P12 : ByteStreamFifoSource 单次 FIFO 读块上限 4096B。根因：P2 的
+#         StreamReplicator 主副本(DummySink)读 100000B，而客户端副本的
+#         StreamParser 只申请 BANK_SIZE-fTotNumValidBytes(83~99KB)，
+#         StreamReplica::copyReceivedFrame() 会静默截断，且
+#         StreamParser::afterGettingBytes() 忽略 numTruncatedBytes ——
+#         H264 字节流中间凭空少 1~17KB，把 62KB 的 IDR 削成 45~60KB。
+#   P13 : StreamParser 在 bank 剩余空间 <8192B 时提前轮换 bank，保证副本
+#         缓冲恒 >=8192B；配合 P12 的 4096B 上限杜绝一切静默截断。
+#         StreamReplicator 增加 rrtspReplicaTruncNotify() 取证钩子。
+#
+#   决定性同窗 A/B (tools/idr_ab_audit.py，按 NALU 头签名对齐 mirror 与 wire)：
+#     P11 : 精确 IDR  6/40 (15.0%)，被削 34/40，最大 -17496B，均值 -4596B
+#     P12 : 精确 IDR 33/43 (76.7%)，被削 10/43，最大  -3329B，均值  -418B
+#     P13 : 精确 IDR 43/43 (100%)，被削  0/43，最大      0B，均值     0B
+#   120s P13 裸流：RTP 序号缺口 0、丢包 0、IDR 59566/61557/63484B、
+#     decoder MB errors 1（窗口边界），P13 截断钩子 0 次。
+#   Frigate 04:34..04:39 UTC 连续 33 个分段：每段 0 个
+#     "error while decoding MB"、0 个 corrupt frame（P6 基线为每段 7~8 个）。
+#   帧级 PTS 04:34..04:39：7382 帧、>1.5s 空隙 0 个、最大间隙 0.966s。
+#   部署于测试相机 bin/rRTSPServer（v0.4.0 验收窗口，UTC 04:33:44）。
+#   详见 docs/FINDINGS.md（P12/P13 结论）。
+#
+# h264grabber.hardened (14312 B, v0.4.0, CURRENT)
+#   P9 + P11b。必须与 rRTSPServer.hardened 配套部署；单独换 server 不换
+#   grabber 会在 FIFO 中途打开读端，缺少干净 SPS/PPS/IDR，放大绿屏。
+#   通过 killall h264grabber 让 wd_rtsp.sh::restart_grabber() 同步重建两者。
+#
+# rRTSPServer.p6-v0.3.0 (151240 B)
+#   live555 2023.01.19 + yi-hack-v5 0.4.1 + patches 001-007
+#   P1  : FIFO read() < 0 EAGAIN defense.
+#   P3  : SO_KEEPALIVE / TCP_KEEPIDLE on accepted client sockets.
+#   P4a : send-failure instrumentation hook (not a teardown criterion).
+#   P4v2: in-process watchdog reads /proc/net/dev wlan0 tx every 1s;
+#         clients present but egress < 15 KB/s for 3 rounds tears down sessions;
+#         20s teardown cooldown prevents stitched outages; SIGPIPE ignored;
+#         crash handler and open()/write() based logging (no stdio buffering).
+#   P2  : process-lifetime StreamReplicator + DummySink replica + self-held
+#         O_WRONLY|O_NONBLOCK FIFO writer; source survives session teardown.
+#   P5  : RTPInterface::sendDataOverTCP() on a failed blocking retry / hard
+#         error now calls shutdown(SHUT_RDWR) before removeStreamSocket().
+#   P6  : blocking-send timeout 200ms -> 1000ms. P5b A/B tested and REVERTED.
+#   Scope: cuts avoidable disconnects ~45.6/h -> ~5.6/h over 43min, zero
+#         process restarts, but does NOT fix green screen or frame-level PTS
+#         (second 21min window FAIL, 4 gaps, largest 7.311s).
+#         See docs/FINDINGS.md (green-screen verdict withdrawn).
+#
+# rRTSPServer.p7/p11/p12-v0.4.0-rc, h264grabber.p9-v0.4.0-rc
+#   Intermediate builds kept for bisecting the byte-truncation root cause.
+#
+# rRTSPServer.p2-persistent-replicator (150984 B, v0.2.0)
+#   Previous release (patches 001-005). One-step rollback target.
+#
+# rRTSPServer.p4v2-cooling (149940 B, v0.1.0)
+#   Older release (patches 001-004). Kept for a two-step rollback.
+#
+# rRTSPServer.stock
+#   Stock yi-hack-v5 0.4.1 bin/rRTSPServer, kept for reference.

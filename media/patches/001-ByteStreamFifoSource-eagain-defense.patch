@@ -1,0 +1,43 @@
+--- a/src/ByteStreamFifoSource.cpp
++++ b/src/ByteStreamFifoSource.cpp
+@@ -24,6 +24,8 @@
+ #include "GroupsockHelper.hh"
+ 
+ #include <fcntl.h>
++#include <errno.h>
++#include <sys/time.h> // 加固(P4v2)
+ 
+ ////////// ByteStreamFifoSource //////////
+ 
+@@ -141,6 +143,17 @@
+     fFrameSize = fread(fTo, 1, fMaxSize, fFid);
+ #else
+     fFrameSize = read(fileno(fFid), fTo, fMaxSize);
++    if (fFrameSize < 0) {
++        // 加固(P1)：非阻塞 FIFO 无数据(EAGAIN)或被信号中断时，静默返回等下次事件。
++        // 原代码会把 read()=-1 存进 unsigned fFrameSize(=0xFFFFFFFF) 后照常 afterGetting，
++        // 造成下游按 4GB 帧处理 —— 潜在堆灾难。
++        int savedErrno = errno;
++        if (savedErrno == EAGAIN || savedErrno == EWOULDBLOCK || savedErrno == EINTR) {
++            return;
++        }
++        handleClosure();
++        return;
++    }
+ #endif
+     if (fFrameSize == 0) {
+         handleClosure();
+@@ -148,6 +161,13 @@
+     }
+     fNumBytesToStream -= fFrameSize;
+ 
++    // 加固(P4v2)：视频 FIFO 读到帧 → 刷新健康心跳（供 rRTSPServer.cpp 巡检判楔死）
++    {
++        extern u_int64_t gLastVideoReadMs;
++        struct timeval tv; gettimeofday(&tv, NULL);
++        gLastVideoReadMs = (u_int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
++    }
++
+     // Set the 'presentation time':
+     if (fPlayTimePerFrame > 0 && fPreferredFrameSize > 0) {
+         if (fPresentationTime.tv_sec == 0 && fPresentationTime.tv_usec == 0) {

@@ -1,0 +1,242 @@
+# P18b (v0.5.1): 拥塞丢帧位置修正 —— 只丢后续新帧直到 IDR，已入队数据一字节不动
+# 生成方式：diff -u p18-backup/*.v050-p18 -> live/*
+
+--- a/liveMedia/RTPInterface.cpp
++++ b/liveMedia/RTPInterface.cpp
+@@ -73,6 +73,8 @@
+ extern "C" void rrtspTcpDropNotify(int socketNum, unsigned char channel, unsigned packetSize);
+ // 加固(P18)：主动丢帧但保持连接时打点（节流）。
+ extern "C" void rrtspTcpDropFrameNotify(int socketNum, unsigned frames, unsigned bytes);
++// 加固(P18b)：进入 / 退出「丢新帧直到 IDR」状态时打点（节流）。
++extern "C" void rrtspTcpDropUntilIdrNotify(int socketNum, unsigned frames, Boolean recoveredByKeyframe);
+ #ifndef MSG_NOSIGNAL
+ #define MSG_NOSIGNAL 0x4000
+ #endif
+@@ -100,6 +102,13 @@
+   struct timeval blockedSince;
+   struct timeval lastProgress;  // 最近一次 send() 真正写出字节的时刻
+   Boolean blocked;
++  // 加固(P18b)：队列满后不再动已入队数据，改为丢弃「后续新帧」直到
++  // 遇到下一个 IDR/SPS/PPS。已发出的 NAL 序列因此永远完整，客户端只会
++  // 跳过一段完整帧并从关键帧重新同步 —— 不缺参考帧、不收半个 NAL、
++  // 不产生 concealment 花屏，也绝不因拥塞断开 TCP。
++  Boolean dropUntilIdr;
++  struct timeval dropSince;     // 超时保护，避免 GOP 异常长时永久冻结
++  unsigned droppedFrames;      // 本轮已丢弃的新帧数（仅用于取证日志）
+ };
+ 
+ static RrtspOutq sRrtspOutq[RRTSP_OUTQ_MAX_FLOWS];
+@@ -199,11 +208,41 @@
+     return (p[hdr + 1] & 0x80) != 0;                  // FU S bit
+   }
+   return True;
++}
++
++// 加固(P18b)：判断一个「新到的 RTP 包」是否为可安全恢复发送的重同步点。
++// 只在视频 RTP 通道(ch=0)上调用：AAC/RTCP 的 payload 不是 H.264 NAL，
++// 用 NAL type 去套会随机命中 5/7/8 而误判成 IDR。
++//   IDR(5) / SPS(7) / PPS(8) / 聚合包 STAP-A..D(24..27) 都是 GOP 起点；
++//   FU-A/FU-B(28/29) 只有 S 位为 1 且 NAL type 为 IDR 时才是起点。
++static Boolean rrtspOutqIsKeyframePacket(u_int8_t const* p, unsigned len) {
++  if (len < 13 || (p[0] & 0xC0) != 0x80) return False;  // 非 RTP v2
++  unsigned hdr = 12u + 4u * (unsigned)(p[0] & 0x0F);    // 固定头 + CSRC
++  if ((p[0] & 0x10) != 0) {                             // X: RTP 扩展头
++    if (hdr + 4 > len) return False;
++    unsigned extWords = ((unsigned)p[hdr + 2] << 8) | p[hdr + 3];
++    hdr += 4u + 4u * extWords;
++  }
++  if (hdr >= len) return False;
++  u_int8_t nalType = p[hdr] & 0x1F;
++  if (nalType == 5 || nalType == 7 || nalType == 8) return True;
++  if (nalType >= 24 && nalType <= 27) return True;       // 聚合包常含参数集+IDR
++  if (nalType == 28 || nalType == 29) {
++    if (hdr + 1 >= len) return False;
++    return (p[hdr + 1] & 0x80) != 0 &&
++           (p[hdr + 1] & 0x1F) == 5;                    // FU-A IDR 首片
++  }
++  return False;
+ }
+ 
+ // 加固(P18)：队列满时丢弃「最老的整帧」，直到腾出 need 字节，并让
+-// 保留下来的队首恰好落在完整 NAL 起点。丢弃边界永远在 4 字节帧头上，
+-// 客户端只会缺几个完整 NAL，永远不会收到半个 NAL -> 不绿屏 / 不拉丝。
++// 保留下来的队首恰好落在完整 NAL 起点。
++//
++// 加固(P18b)：此路径已废弃、不再被调用。它只保证「队首是完整 NAL 起点」，
++// 并不保证落在 IDR；丢弃 IDR/P 参考帧、或把已发出的 FU-A 前片与队列中
++// 剩余片拆开，都会让解码器做 concealment -> 花屏 / 拉丝。P18b 改为
++// 「只丢后续新帧直到下一个 IDR」，已入队数据一字节不动。函数保留作
++// 设计对照与极端兜底，正常路径绝不进入。
+ // 返回丢弃帧数；0 表示队首帧已部分发出、当前不能安全丢帧。
+ static unsigned rrtspOutqDropOldest(RrtspOutq* q, unsigned need,
+                                     unsigned* droppedBytes) {
+@@ -613,11 +652,12 @@
+ 
+ ////////// Helper Functions - Implementation /////////
+ 
+-// 加固(P5)/加固(P7)/加固(P18)：取证钩子，由应用层 rRTSPServer.cpp 提供
+-//（用 open/write 写日志，不用 stdio；声明与文件前部等价）。
++// 加固(P5)/加固(P7)/加固(P18)/加固(P18b)：取证钩子，由应用层
++// rRTSPServer.cpp 提供（用 open/write 写日志，不用 stdio；声明与文件前部等价）。
+ extern "C" void rrtspTcpFailureNotify(int socketNum, int reason, unsigned sendResult);
+ extern "C" void rrtspTcpDropNotify(int socketNum, unsigned char channel, unsigned packetSize);
+ extern "C" void rrtspTcpDropFrameNotify(int socketNum, unsigned frames, unsigned bytes);
++extern "C" void rrtspTcpDropUntilIdrNotify(int socketNum, unsigned frames, Boolean recoveredByKeyframe);
+ 
+ // 加固(P6)：把 P5 的 200ms 放宽到 1000ms（上游原值 500ms）。
+ // 200ms 在相机 Wi-Fi 上排不空瞬时拥塞的 TCP 发送缓冲，导致每一次
+@@ -681,34 +721,46 @@
+     return False;
+   }
+ 
+-  // 2) 完整追加本帧。
+-  // 加固(P18)：容量不足时按帧边界丢弃「最老的整帧」腾出空间再追加，
+-  // 不再 shutdown。丢帧边界落在完整 NAL 起点，客户端只缺几个完整 NAL。
+-  unsigned need = 4 + packetSize;
+-  if (!rrtspOutqAppend(q, framingHeader, packet, packetSize)) {
+-    unsigned droppedBytes = 0;
+-    unsigned dropped = rrtspOutqDropOldest(q, need, &droppedBytes);
+-    if (dropped > 0) {
+-      rrtspTcpDropFrameNotify(socketNum, dropped, droppedBytes);
+-      int dr = rrtspOutqDrain(q);   // head 已前移，先再排一次
+-      if (dr < 0) {
+-        rrtspTcpFailureNotify(socketNum, 3, 0);
+-        shutdown(socketNum, SHUT_RDWR);
+-        removeStreamSocket(socketNum, 0xFF);
+-        rrtspOutqRelease(q);
+-        return False;
+-      }
+-    }
+-    if (!rrtspOutqAppend(q, framingHeader, packet, packetSize)) {
+-      // 极端情形：单帧大于队列上限，或队首帧已部分发出暂时不能丢。
+-      // 只丢弃「当前这个新帧」，绝不因为拥塞断开连接。
++  // 2) 加固(P18b)：若上一轮因队列满进入「丢新帧直到 IDR」状态，
++  // 这里只丢当前「新帧」，绝不触碰已入队数据 —— 已发出的 NAL 序列
++  // 因此永远完整。音视频一起丢，保证 P15 的 setts/asetpts 双 CFR
++  // 时间轴相位不漂移。
++  if (q->dropUntilIdr) {
++    Boolean key = (streamChannelId == 0) &&
++                  rrtspOutqIsKeyframePacket(packet, packetSize);
++    struct timeval now; gettimeofday(&now, NULL);
++    unsigned ageMs = (unsigned)
++        ((now.tv_sec - q->dropSince.tv_sec) * 1000 +
++         (now.tv_usec - q->dropSince.tv_usec) / 1000);
++    if (!key && ageMs < 2000) {
++      q->droppedFrames++;
+       rrtspTcpDropNotify(socketNum, streamChannelId, packetSize);
+-      rrtspTcpDropFrameNotify(socketNum, 1, need);
+       rrtspOutqScheduleRetry();
+       return True;
+     }
++    // 遇到 IDR/SPS/PPS 正常恢复；2s 超时是 GOP 异常长时的防冻结保底。
++    q->dropUntilIdr = False;
++    rrtspTcpDropUntilIdrNotify(socketNum, q->droppedFrames, key);
++    q->droppedFrames = 0;
+   }
+ 
++  // 3) 完整追加本帧。
++  unsigned need = 4 + packetSize;
++  if (!rrtspOutqAppend(q, framingHeader, packet, packetSize)) {
++    // 加固(P18b)：装不下时绝不丢弃「已入队帧」——那会拆断 NAL 分片、
++    // 丢掉 IDR/P 参考帧并触发解码 concealment 花屏。改为进入
++    // drop-until-IDR：当前新帧直接丢弃，后续新帧继续丢，直到下一个
++    // SPS/PPS/IDR 才恢复入队；已入队数据只靠 drain 自然排空。
++    // 客户端看到的是「跳过一段完整帧 + 从关键帧干净重同步」。
++    q->dropUntilIdr = True;
++    gettimeofday(&q->dropSince, NULL);
++    q->droppedFrames = 1;
++    rrtspTcpDropNotify(socketNum, streamChannelId, packetSize);
++    rrtspTcpDropUntilIdrNotify(socketNum, 0, False);   // 0 = ENTER
++    rrtspOutqScheduleRetry();
++    return True;
++  }
++
+   // 3) 立刻排空：正常路径零额外延迟、零拷贝以外的开销。
+   r = rrtspOutqDrain(q);
+   if (r < 0) {
+@@ -721,17 +773,19 @@
+   if (q->len == 0) return True;
+ 
+   // 4) 拥塞态：不阻塞、不断链。
+-  // 加固(P18)：队列接近上限时按帧边界丢最老的整帧；「连续 30s 零进展 =
+-  // 真死连接」的唯一判定统一放在 rrtspOutqRetryTask()，避免两处计时口径
+-  // 不一致。正常瞬时拥塞只会丢几帧，绝不再主动 shutdown。
++  // 加固(P18b)：接近上限时只「预警」进入 drop-until-IDR，绝不动已入队帧。
++  // 「连续 30s 零进展 = 真死连接」的唯一判定仍在 rrtspOutqRetryTask()，
++  // 避免两处计时口径不一致。瞬时拥塞只让后续新帧跳过到下一个关键帧，
++  // 绝不主动 shutdown。
+   if (!q->blocked) {
+     q->blocked = True;
+     gettimeofday(&q->blockedSince, NULL);
+   }
+-  if (q->len + need >= RRTSP_OUTQ_MAX_CAP) {
+-    unsigned droppedBytes = 0;
+-    unsigned dropped = rrtspOutqDropOldest(q, need, &droppedBytes);
+-    if (dropped > 0) rrtspTcpDropFrameNotify(socketNum, dropped, droppedBytes);
++  if (!q->dropUntilIdr && q->len + need >= RRTSP_OUTQ_MAX_CAP) {
++    q->dropUntilIdr = True;
++    gettimeofday(&q->dropSince, NULL);
++    q->droppedFrames = 0;
++    rrtspTcpDropUntilIdrNotify(socketNum, 0, False);   // 0 = ENTER
+   }
+   rrtspTcpDropNotify(socketNum, streamChannelId, q->len); // 应用层节流打点
+   rrtspOutqScheduleRetry();
+
+--- a/src/rRTSPServer.cpp
++++ b/src/rRTSPServer.cpp
+@@ -150,10 +150,12 @@
+ }
+ // ===== 加固(P11) 结束 =====
+ 
+-// ===== 加固(P18)：拥塞丢帧取证钩子（节流） =====
+-// RTPInterface 在队列接近上限时按 NAL 边界丢弃「最老的整帧」，并且
+-// 保持 TCP 连接。这是 P18 与 P11 的根本区别：P11 队列满会 shutdown，
+-// P18 丢帧不断链 —— 客户端不重连、不从 GOP 中间起播，短秒断流消失。
++// ===== 加固(P18)/加固(P18b)：拥塞丢帧取证钩子（节流） =====
++// P18 把「队列满就 shutdown」改成「丢帧不断链」，短秒断流消失。
++// P18b 进一步修正丢帧位置：P18 会丢「最老的已入队帧」，可能丢掉
++// IDR/P 参考帧或拆断 FU-A 分片，造成解码 concealment 花屏；P18b 改为
++// 只丢「后续新帧」直到下一个 SPS/PPS/IDR，已入队数据一字节不动，
++// 客户端从关键帧干净重同步。连接始终保持。
+ // 拥塞期间每帧都会回调，必须聚合成每秒一行：相机 /tmp 是 tmpfs，
+ // MemFree 常仅 3-4MB，日志本身不能变成新负载。
+ volatile unsigned gP18DropFrames = 0;
+@@ -173,6 +175,29 @@
+         bytesSinceLog = 0;
+     }
+ }
++// ===== 加固(P18b)：drop-until-IDR 状态取证钩子（节流） =====
++// frames==0 表示 ENTER（刚进入丢新帧状态），>0 表示 EXIT。
++// recoveredByKeyframe=True 表示按预期遇到 IDR/SPS/PPS 恢复；False 表示
++// 2s 防冻结保底超时恢复（现场若频繁出现，说明该相机 GOP 异常长）。
++volatile unsigned gP18bDropCycles = 0;
++extern "C" void rrtspTcpDropUntilIdrNotify(int socketNum, unsigned frames,
++                                           Boolean recoveredByKeyframe) {
++    static time_t lastEnterLog = 0;
++    time_t now = time(NULL);
++    if (frames == 0) {
++        if (now != lastEnterLog) {
++            hardenedLog("P18b: drop-until-idr ENTER socket=%d; queued frames kept intact, connection kept",
++                        socketNum);
++            lastEnterLog = now;
++        }
++        return;
++    }
++    gP18bDropCycles++;
++    hardenedLog("P18b: drop-until-idr EXIT frames=%u by_keyframe=%d cycles=%u socket=%d; connection kept",
++                frames, (int)recoveredByKeyframe, gP18bDropCycles, socketNum);
++}
++// ===== 加固(P18b) 结束 =====
++
+ // ===== 加固(P18) 结束 =====
+ 
+ // ===== 加固(P13)：StreamReplicator 静默截断取证钩子（节流） =====
+@@ -771,7 +796,7 @@
+     /* gRTPSendErrorHook = rtpSendErrorHook; */
+ 
+     // 加固(P4v2)：启动 FIFO 无消费巡检
+-    hardenedLog("hardened rRTSPServer starting (P1/P2/P3/P4/P4v2/P5/P6/P7/P9/P11/P11a/P12/P13/P18), pid=%d, sigpipe=ignored", getpid());
++    hardenedLog("hardened rRTSPServer starting (P1/P2/P3/P4/P4v2/P5/P6/P7/P9/P11/P11a/P12/P13/P18/P18b), pid=%d, sigpipe=ignored", getpid());
+     scheduleHealthCheck();
+ 
+     env->taskScheduler().doEventLoop(); // does not return

@@ -1,0 +1,343 @@
+--- a/liveMedia/RTPInterface.cpp
++++ b/liveMedia/RTPInterface.cpp
+@@ -23,8 +23,170 @@
+ #include "RTPInterface.hh"
+ #include <GroupsockHelper.hh>
+ #include <stdio.h>
+-#include <sys/socket.h> // 加固(P5)：shutdown() / SHUT_RDWR
++#include <string.h> // 加固(P7)：memset
++#include <errno.h> // 加固(P7)：EAGAIN / EINTR
++#include <sys/socket.h> // 加固(P5)：shutdown() / SHUT_RDWR；加固(P7)：sendmsg/iovec
+ 
++// ===== 加固(P11)：RTP/TCP 用户态非阻塞发送队列 =====
++// 背景（现场取证）：相机 net.core.wmem_max = 163840，TCP 发送缓冲约 160KB，
++// 只够约 1.2 秒的 1080p 码率。消费端(go2rtc/Frigate)或 Wi-Fi 的一次 >1s
++// 抖动就会把缓冲填满；此时 sendmsg() 返回「部分写入」，P7 走进 1000ms 阻塞
++// 补发，补发失败即 shutdown 干净断链。客户端重连后新会话从 GOP 中间起播，
++// 前若干个 P slice 无 SPS/PPS/IDR，解码 concealment 渲染成绿屏 / 竖向拉丝。
++// 相机 2026-11-08 02:45-03:27 UTC 日志：P7 的 EAGAIN 丢包路径 0 次命中，
++// 而 P5 的 reason=4（部分写补发失败）命中 7 次 —— P7 的设计前提在本机
++// 不成立：非阻塞 sendmsg 几乎总是「写了几百字节」而不是 EAGAIN。
++//
++// P11 的做法：把每一帧完整的 '$' 交错帧（4 字节头 + RTP 包）按字节顺序
++// 追加到该 socket 的用户态队列；所有写都是非阻塞 send()，排不出去的字节
++// 原样留在队列里，下次发送前或 10ms 后台任务里继续排空。
++//   * 永远不会出现「帧头已发、payload 没发」的半帧 -> TCP 流永远对齐；
++//   * 不阻塞单线程事件循环 -> 不再有 1s 量级的全客户端停顿；
++//   * 不因瞬时拥塞断链 -> 不再有 GOP 中间起播 -> 根治绿屏/拉丝；
++//   * 只要队列没到上限，一个字节都不丢，画面时间轴保持连续。
++// 配套 P11a：accept 时把 SO_SNDBUF 从 160KB 提升到 512KB，并把
++// net.core.wmem_max 提升到 1MB（rRTSPServer main() 完成），把绝大多数
++// 抖动直接吸收在内核缓冲里，用户态队列只在极端情况下才被用到。
++// 兜底：队列超限或拥塞持续 >6s，说明消费端确实死了，仍走 P5 干净断链。
++#include <sys/time.h>
++#include <sys/types.h>
++// 取证钩子由应用层 rRTSPServer.cpp 提供（文件后部还有一处等价声明）。
++extern "C" void rrtspTcpFailureNotify(int socketNum, int reason, unsigned sendResult);
++extern "C" void rrtspTcpDropNotify(int socketNum, unsigned char channel, unsigned packetSize);
++#ifndef MSG_NOSIGNAL
++#define MSG_NOSIGNAL 0x4000
++#endif
++#ifndef MSG_DONTWAIT
++#define MSG_DONTWAIT 0x40
++#endif
++
++#define RRTSP_OUTQ_MAX_FLOWS   8
++#define RRTSP_OUTQ_INIT_CAP    (32*1024)
++#define RRTSP_OUTQ_MAX_CAP     (192*1024)
++#define RRTSP_OUTQ_MAX_AGE_MS  6000
++#define RRTSP_OUTQ_RETRY_US    10000
++
++struct RrtspOutq {
++  int sock;
++  Boolean used;
++  u_int8_t* buf;
++  unsigned cap, head, len;
++  struct sockaddr_storage peer;
++  socklen_t peerLen;
++  struct timeval blockedSince;
++  Boolean blocked;
++};
++
++static RrtspOutq sRrtspOutq[RRTSP_OUTQ_MAX_FLOWS];
++static UsageEnvironment* sRrtspOutqEnv = NULL;
++static Boolean sRrtspOutqRetryScheduled = False;
++static void rrtspOutqRetryTask(void*);
++
++static void rrtspOutqRelease(RrtspOutq* q) {
++  delete[] q->buf;
++  memset(q, 0, sizeof(*q));
++}
++
++// fd 会被内核复用。仅当队列里还有未发完的字节时才校验对端身份，
++// 正常路径零额外系统调用。
++static Boolean rrtspOutqPeerMatches(RrtspOutq* q) {
++  struct sockaddr_storage cur;
++  socklen_t curLen = sizeof cur;
++  if (getpeername(q->sock, (struct sockaddr*)&cur, &curLen) < 0) return False;
++  if (curLen != q->peerLen) return False;
++  return memcmp(&cur, &q->peer, curLen) == 0;
++}
++
++static RrtspOutq* rrtspOutqFor(int sock) {
++  RrtspOutq* slot = NULL;
++  for (int i = 0; i < RRTSP_OUTQ_MAX_FLOWS; ++i) {
++    if (sRrtspOutq[i].used && sRrtspOutq[i].sock == sock) {
++      if (sRrtspOutq[i].len > 0 && !rrtspOutqPeerMatches(&sRrtspOutq[i])) {
++        rrtspOutqRelease(&sRrtspOutq[i]); // 旧连接已关闭，fd 被新连接复用
++        continue;
++      }
++      return &sRrtspOutq[i];
++    }
++    if (!sRrtspOutq[i].used && slot == NULL) slot = &sRrtspOutq[i];
++  }
++  if (slot == NULL) return NULL;
++  memset(slot, 0, sizeof(*slot));
++  slot->peerLen = sizeof slot->peer;
++  if (getpeername(sock, (struct sockaddr*)&slot->peer, &slot->peerLen) < 0) return NULL;
++  slot->cap = RRTSP_OUTQ_INIT_CAP;
++  slot->buf = new u_int8_t[slot->cap];
++  if (slot->buf == NULL) return NULL;
++  slot->sock = sock;
++  slot->used = True;
++  return slot;
++}
++
++// 返回 1=已排空, 0=内核缓冲满(稍后重试), -1=硬错误(需断链)
++static int rrtspOutqDrain(RrtspOutq* q) {
++  while (q->len > 0) {
++    ssize_t w = send(q->sock, (char const*)(q->buf + q->head), q->len,
++                     MSG_DONTWAIT | MSG_NOSIGNAL);
++    if (w > 0) { q->head += (unsigned)w; q->len -= (unsigned)w; continue; }
++    if (w < 0 && errno == EINTR) continue;
++    if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
++    return -1;
++  }
++  q->head = 0;
++  q->blocked = False;
++  return 1;
++}
++
++static Boolean rrtspOutqAppend(RrtspOutq* q, u_int8_t const* hdr,
++                               u_int8_t const* pkt, unsigned pktSize) {
++  unsigned need = 4 + pktSize;
++  if (q->head + q->len + need > q->cap) {
++    if (q->len > 0) memmove(q->buf, q->buf + q->head, q->len);
++    q->head = 0;
++    if (q->len + need > q->cap) {
++      unsigned newCap = q->cap;
++      while (newCap < q->len + need && newCap < RRTSP_OUTQ_MAX_CAP) newCap *= 2;
++      if (q->len + need > newCap) return False;
++      u_int8_t* nb = new u_int8_t[newCap];
++      if (nb == NULL) return False;
++      memcpy(nb, q->buf, q->len);
++      delete[] q->buf;
++      q->buf = nb;
++      q->cap = newCap;
++    }
++  }
++  memcpy(q->buf + q->head + q->len, hdr, 4);
++  memcpy(q->buf + q->head + q->len + 4, pkt, pktSize);
++  q->len += need;
++  return True;
++}
++
++static void rrtspOutqScheduleRetry() {
++  if (sRrtspOutqRetryScheduled || sRrtspOutqEnv == NULL) return;
++  sRrtspOutqRetryScheduled = True;
++  sRrtspOutqEnv->taskScheduler().scheduleDelayedTask(
++      RRTSP_OUTQ_RETRY_US, (TaskFunc*)rrtspOutqRetryTask, NULL);
++}
++
++static void rrtspOutqRetryTask(void*) {
++  sRrtspOutqRetryScheduled = False;
++  Boolean any = False;
++  for (int i = 0; i < RRTSP_OUTQ_MAX_FLOWS; ++i) {
++    RrtspOutq* q = &sRrtspOutq[i];
++    if (!q->used || q->len == 0) continue;
++    if (!rrtspOutqPeerMatches(q)) { rrtspOutqRelease(q); continue; }
++    int r = rrtspOutqDrain(q);
++    if (r < 0) {
++      rrtspTcpFailureNotify(q->sock, 5, 0);
++      shutdown(q->sock, SHUT_RDWR);
++      rrtspOutqRelease(q);
++      continue;
++    }
++    if (q->len > 0) any = True;
++  }
++  if (any) rrtspOutqScheduleRetry();
++}
++// ===== 加固(P11) 结束 =====
++
+ ////////// Helper Functions - Definition //////////
+ 
+ // Helper routines and data structures, used to implement
+@@ -340,48 +502,114 @@
+ 
+ ////////// Helper Functions - Implementation /////////
+ 
+-Boolean RTPInterface::sendRTPorRTCPPacketOverTCP(u_int8_t* packet, unsigned packetSize,
+-						 int socketNum, unsigned char streamChannelId,
+-						 TLSState* tlsState) {
+-#ifdef DEBUG_SEND
+-  fprintf(stderr, "sendRTPorRTCPPacketOverTCP: %d bytes over channel %d (socket %d)\n",
+-	  packetSize, streamChannelId, socketNum); fflush(stderr);
+-#endif
+-  // Send a RTP/RTCP packet over TCP, using the encoding defined in RFC 2326, section 10.12:
+-  //     $<streamChannelId><packetSize><packet>
+-  // (If the initial "send()" of '$<streamChannelId><packetSize>' succeeds, then we force
+-  // the subsequent "send()" for the <packet> data to succeed, even if we have to do so with
+-  // a blocking "send()".)
+-  do {
+-    u_int8_t framingHeader[4];
+-    framingHeader[0] = '$';
+-    framingHeader[1] = streamChannelId;
+-    framingHeader[2] = (u_int8_t) ((packetSize&0xFF00)>>8);
+-    framingHeader[3] = (u_int8_t) (packetSize&0xFF);
+-    // 加固(P6)：P5b 假设已证伪，回滚为上游原始语义 False。
+-    // P5b 曾假设「帧头 EAGAIN 丢整包 -> I 帧残缺 -> 绿屏」，把这里改成 True。
+-    // 现场 A/B：P5 版 31/32 段 31 errors / 795 frames = 3.90%，
+-    // P5b 版 37/38 段 40 errors / 1050 frames = 3.81%，几乎无改善。
+-    // 直连相机重组裸流同样稳定出现 bytestream 错误，且裸流开头 15 个
+-    // P slice 在首个 SPS/PPS/IDR 之前 —— 绿屏来自「新会话从 GOP 中间起播」
+-    // 与频繁断链，不是这个 4 字节帧头。不要把未证实的假设固化进代码。
+-    if (!sendDataOverTCP(socketNum, tlsState, framingHeader, 4, False)) break;
++// 加固(P5)/加固(P7)：取证钩子，由应用层 rRTSPServer.cpp 提供（用 open/write 写日志，不用 stdio）。
++extern "C" void rrtspTcpFailureNotify(int socketNum, int reason, unsigned sendResult);
++extern "C" void rrtspTcpDropNotify(int socketNum, unsigned char channel, unsigned packetSize);
+ 
+-    if (!sendDataOverTCP(socketNum, tlsState, packet, packetSize, True)) break;
+-#ifdef DEBUG_SEND
+-    fprintf(stderr, "sendRTPorRTCPPacketOverTCP: completed\n"); fflush(stderr);
++// 加固(P6)：把 P5 的 200ms 放宽到 1000ms（上游原值 500ms）。
++// 200ms 在相机 Wi-Fi 上排不空瞬时拥塞的 TCP 发送缓冲，导致每一次
++// 瞬时 EAGAIN 都变成断链（00:25 UTC 那五分钟 11 次，正是用户报告
++// 绿屏的时段）。1000ms 让绝大多数瞬时拥塞排空；真正楔死的连接才
++// 走 shutdown() 断链，P4v2 兜底仍在。
++// （加固(P7) 起：瞬时拥塞改由 sendmsg 整包丢弃兜住，阻塞重试只剩
++// 「部分写入后补完」这一条路径。）
++#ifndef RTPINTERFACE_BLOCKING_WRITE_TIMEOUT_MS
++#define RTPINTERFACE_BLOCKING_WRITE_TIMEOUT_MS 1000
+ #endif
+ 
++Boolean RTPInterface::sendRTPorRTCPPacketOverTCP(u_int8_t* packet, unsigned packetSize,
++						 int socketNum, unsigned char streamChannelId,
++						 TLSState* tlsState) {
++  // 加固(P11)：「排队不断链」。帧头与 payload 作为一个整体入队，
++  // 非阻塞排空；瞬时拥塞只让帧晚到几十毫秒，不丢字节、不断链、
++  // 不让客户端重连，因此不再出现 GOP 中间起播的绿屏 / 竖向拉丝。
++  u_int8_t framingHeader[4];
++  framingHeader[0] = '$';
++  framingHeader[1] = streamChannelId;
++  framingHeader[2] = (u_int8_t) ((packetSize&0xFF00)>>8);
++  framingHeader[3] = (u_int8_t) (packetSize&0xFF);
++
++  if (tlsState != NULL && tlsState->isNeeded) {
++    // TLS 路径保持上游语义（相机固件 NO_OPENSSL，实际不会走到这里）
++    if (!sendDataOverTCP(socketNum, tlsState, framingHeader, 4, False)) return False;
++    if (!sendDataOverTCP(socketNum, tlsState, packet, packetSize, True)) return False;
+     return True;
+-  } while (0);
++  }
+ 
+-#ifdef DEBUG_SEND
+-  fprintf(stderr, "sendRTPorRTCPPacketOverTCP: failed! (errno %d)\n", envir().getErrno()); fflush(stderr);
+-#endif
+-  return False;
++  sRrtspOutqEnv = &envir();
++  RrtspOutq* q = rrtspOutqFor(socketNum);
++  if (q == NULL) {
++    // 并发连接超过表容量 / getpeername 失败：退回 P7 的原子 sendmsg，
++    // 绝不因队列不可用而崩溃。
++    struct iovec iov[2];
++    iov[0].iov_base = (char*)framingHeader; iov[0].iov_len = 4;
++    iov[1].iov_base = (char*)packet;        iov[1].iov_len = packetSize;
++    struct msghdr msg; memset(&msg, 0, sizeof msg);
++    msg.msg_iov = iov; msg.msg_iovlen = 2;
++    ssize_t sent = sendmsg(socketNum, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
++    if (sent == (ssize_t)(4 + packetSize)) return True;
++    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
++      rrtspTcpDropNotify(socketNum, streamChannelId, packetSize);
++      return True;
++    }
++    rrtspTcpFailureNotify(socketNum, 3, (unsigned)sent);
++    shutdown(socketNum, SHUT_RDWR);
++    removeStreamSocket(socketNum, 0xFF);
++    return False;
++  }
++
++  // 1) 先把上次没发完的字节排出去（永远不会出现半帧）。
++  int r = rrtspOutqDrain(q);
++  if (r < 0) {
++    rrtspTcpFailureNotify(socketNum, 3, 0);
++    shutdown(socketNum, SHUT_RDWR);
++    removeStreamSocket(socketNum, 0xFF);
++    rrtspOutqRelease(q);
++    return False;
++  }
++
++  // 2) 完整追加本帧。
++  if (!rrtspOutqAppend(q, framingHeader, packet, packetSize)) {
++    rrtspTcpDropNotify(socketNum, streamChannelId, q->len);
++    rrtspTcpFailureNotify(socketNum, 4, q->len);
++    shutdown(socketNum, SHUT_RDWR);
++    removeStreamSocket(socketNum, 0xFF);
++    rrtspOutqRelease(q);
++    return False;
++  }
++
++  // 3) 立刻排空：正常路径零额外延迟、零拷贝以外的开销。
++  r = rrtspOutqDrain(q);
++  if (r < 0) {
++    rrtspTcpFailureNotify(socketNum, 3, 0);
++    shutdown(socketNum, SHUT_RDWR);
++    removeStreamSocket(socketNum, 0xFF);
++    rrtspOutqRelease(q);
++    return False;
++  }
++  if (q->len == 0) return True;
++
++  // 4) 拥塞态：不阻塞、不断链，登记起点并安排 10ms 后台重排。
++  if (!q->blocked) {
++    q->blocked = True;
++    gettimeofday(&q->blockedSince, NULL);
++  }
++  struct timeval now; gettimeofday(&now, NULL);
++  long ageMs = (long)(now.tv_sec - q->blockedSince.tv_sec) * 1000
++             + (now.tv_usec - q->blockedSince.tv_usec) / 1000;
++  if (ageMs > RRTSP_OUTQ_MAX_AGE_MS || q->len >= RRTSP_OUTQ_MAX_CAP) {
++    // 消费端确实死了：保留 P5 干净断链语义，避免无限缓存。
++    rrtspTcpFailureNotify(socketNum, 4, q->len);
++    shutdown(socketNum, SHUT_RDWR);
++    removeStreamSocket(socketNum, 0xFF);
++    rrtspOutqRelease(q);
++    return False;
++  }
++  rrtspTcpDropNotify(socketNum, streamChannelId, q->len); // 应用层节流打点
++  rrtspOutqScheduleRetry();
++  return True;
+ }
+ 
+-#ifndef RTPINTERFACE_BLOCKING_WRITE_TIMEOUT_MS
+ // 加固(P6)：把 P5 的 200ms 放宽到 1000ms（上游原值 500ms）。
+ // P5 的有效修复是「失败时 shutdown 干净断链」，不是「缩短死等」。
+ // 200ms 在相机 Wi-Fi 上排不空瞬时拥塞的 TCP 发送缓冲，导致每一次
+@@ -391,11 +619,16 @@
+ // 下半幅竖向拉丝 / 播放器里的绿块。
+ // 1000ms 让绝大多数瞬时拥塞在阻塞重试中排空；只有真正楔死的连接
+ // 才走到下面的 shutdown()。事件循环最坏多停 1s，P4v2 兜底仍在。
++//
++// 加固(P11) 更新：这段阻塞重试现在只剩 TLS 路径（相机 NO_OPENSSL，不启用）
++// 和 sendDataOverTCP() 的其他调用者。明文 RTP/TCP 已完全改走 P11 的
++// 用户态非阻塞发送队列 —— 不再有部分写、不再有 1s 阻塞、不再因瞬时
++// 拥塞断链。下面的 1000ms 宏仅为保持 sendDataOverTCP() 的上游语义。
++#ifndef RTPINTERFACE_BLOCKING_WRITE_TIMEOUT_MS
+ #define RTPINTERFACE_BLOCKING_WRITE_TIMEOUT_MS 1000
+ #endif
+ 
+-// 加固(P5)：取证钩子，由应用层 rRTSPServer.cpp 提供（用 open/write 写日志，不用 stdio）。
+-extern "C" void rrtspTcpFailureNotify(int socketNum, int reason, unsigned sendResult);
++// 加固(P7)/加固(P11)：取证钩子声明见文件前部。
+ 
+ Boolean RTPInterface::sendDataOverTCP(int socketNum, TLSState* tlsState,
+ 				      u_int8_t const* data, unsigned dataSize,

@@ -1,0 +1,96 @@
+--- a/src/rRTSPServer.cpp
++++ b/src/rRTSPServer.cpp
+@@ -28,6 +28,8 @@
+ #include "ByteStreamFifoSource.hh" // 加固(P2)：常驻视频源
+ 
+ #include <stdio.h> // fdopen/fclose/fprintf (P2)
++#include <fcntl.h> // open/write (P4v2 日志、P11 wmem_max)
++#include <time.h>  // time() (P11 节流日志)
+ #include <sys/stat.h>
+ #include <getopt.h>
+ #include <errno.h>
+@@ -125,6 +127,65 @@
+                 socketNum, reason, sendResult);
+ }
+ // ===== 加固(P5) 结束 =====
++
++// ===== 加固(P11)：拥塞排队取证钩子（节流） =====
++// RTPInterface 在每个「帧已完整入队但内核发送缓冲暂时排不空」的调用上通知这里。
++// 拥塞期间每秒可达 100~200 次调用，相机 /tmp 是 tmpfs 且 MemFree 常仅 1-3MB，
++// 必须聚合成每秒一行，否则日志本身会变成新的负载与空间风险。
++// P7 的「丢整包」语义已由 P11 的「排队不丢字节」取代：连接保持、TCP 流对齐、
++// 一个字节都不丢，客户端不重连、不再从 GOP 中间起播。
++volatile unsigned gP11QueueEvents = 0;
++extern "C" void rrtspTcpDropNotify(int socketNum, unsigned char channel, unsigned packetSize) {
++    gP11QueueEvents++;
++    static time_t lastLog = 0;
++    static unsigned sinceLast = 0;
++    time_t now = time(NULL);
++    sinceLast++;
++    if (now != lastLog) {
++        hardenedLog("P11: tcp output queue blocked socket=%d ch=%u queued=%uB events=%u total=%u; connection kept",
++                    socketNum, (unsigned)channel, packetSize, sinceLast, gP11QueueEvents);
++        lastLog = now;
++        sinceLast = 0;
++    }
++}
++// ===== 加固(P11) 结束 =====
++
++// ===== 加固(P13)：StreamReplicator 静默截断取证钩子（节流） =====
++// liveMedia/StreamReplicator.cpp 的 copyReceivedFrame() 在目标副本缓冲小于
++// 帧长时会把尾部字节丢掉（live555 原生行为，且 StreamParser 忽略
++// numTruncatedBytes）。P12 把 FIFO 读块限到 4096B、P13 让 parser bank 恒留
++// >=8192B 空间后，这个钩子应当永远不触发。留着它做现场「零截断」的直接证据。
++volatile unsigned gP13TruncEvents = 0;
++extern "C" void rrtspReplicaTruncNotify(unsigned frameSize, unsigned maxSize) {
++    gP13TruncEvents++;
++    static time_t lastLog = 0;
++    static unsigned sinceLast = 0;
++    time_t now = time(NULL);
++    sinceLast++;
++    if (now != lastLog) {
++        hardenedLog("P13: replica truncation frame=%u max=%u lost=%u events=%u total=%u",
++                    frameSize, maxSize,
++                    frameSize > maxSize ? frameSize - maxSize : 0,
++                    sinceLast, gP13TruncEvents);
++        lastLog = now;
++        sinceLast = 0;
++    }
++}
++// ===== 加固(P13) 结束 =====
++
++// ===== 加固(P11a)：解除内核 wmem_max 对 SO_SNDBUF 的封顶 =====
++// 相机默认 net.core.wmem_max = 163840，会把 GenericMediaServer 里
++// setsockopt(SO_SNDBUF, 512KB) 静默截断回 160KB。这里在启动时把上限
++// 提到 1MB；只放宽上限、不改变默认值，也不触碰 tcp_wmem 的自动调优。
++static void raiseTcpWmemMax() {
++    int fd = open("/proc/sys/net/core/wmem_max", O_WRONLY);
++    if (fd < 0) return;
++    static char const value[] = "1048576\n";
++    ssize_t w = write(fd, value, sizeof(value) - 1);
++    close(fd);
++    hardenedLog("P11a: net.core.wmem_max -> 1048576 (write=%d)", (int)w);
++}
++// ===== 加固(P11a) 结束 =====
+ 
+ #define VIDEO_STALL_TEARDOWN_MS 4000    // 连续 4 轮(4s)都出现新的发送失败即判楔死
+                                         // （取证证实：楔死时 FIFO 仍被读取、帧被拉出后发送失败丢弃，
+@@ -361,6 +422,9 @@
+     // 这是原代码的隐藏缺陷：原版从不主动关连接所以从未暴露。
+     signal(SIGPIPE, SIG_IGN);
+ 
++    // 加固(P11a)：必须先放宽内核上限，accept 时的 SO_SNDBUF=512KB 才能生效。
++    raiseTcpWmemMax();
++
+     // 加固(P4v2b)：崩溃现场记录器——把致命信号地址/PC 写入 RAM 日志，供本地符号化定位
+     {
+         struct sigaction sa;
+@@ -676,7 +740,7 @@
+     /* gRTPSendErrorHook = rtpSendErrorHook; */
+ 
+     // 加固(P4v2)：启动 FIFO 无消费巡检
+-    hardenedLog("hardened rRTSPServer starting (P1/P2/P3/P4/P4v2/P5/P6), pid=%d, sigpipe=ignored", getpid());
++    hardenedLog("hardened rRTSPServer starting (P1/P2/P3/P4/P4v2/P5/P6/P7/P9/P11/P12/P13), pid=%d, sigpipe=ignored", getpid());
+     scheduleHealthCheck();
+ 
+     env->taskScheduler().doEventLoop(); // does not return

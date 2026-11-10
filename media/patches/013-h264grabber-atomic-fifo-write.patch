@@ -1,0 +1,122 @@
+--- a/src/h264grabber.c
++++ b/src/h264grabber.c
+@@ -165,16 +165,72 @@
+     // Do nothing
+ }
+ 
+-void* unlock_fifo_thread(void *data)
++// ===== 修复(P9)：FIFO 原子写 + 诊断镜像 =====
++// 背景：rmm 写入 /tmp/view 的 IDR 帧是完整的（mmap 直接解码 0 错误），
++// 但 RTSP 出口的每个 IDR 尾部都缺 5-13 字节（ffmpeg: error while decoding
++// MB 46 59, bytestream -N，concealment 填满下半幅 == 画面底部绿色/竖向拉丝）。
++// 原实现用 stdio fwrite()+fflush() 写 FIFO 且不检查返回值：大 I 帧（60-70KB）
++// 在 FIFO 瞬时满（live555 阻塞写 TCP 的窗口内不消费 FIFO）时发生部分写，
++// stdio 不重试尾部字节，IDR 尾部即被截断。改为裸 fd 上的 write_all() 循环，
++// 处理部分写与 EINTR，保证每帧字节完整。
++static int write_all(int fd, const unsigned char *buf, size_t len)
+ {
+-    int fd;
+-    char *fifo_name = data;
+-    unsigned char buffer_fifo[1024];
++    size_t done = 0;
++    while (done < len) {
++        ssize_t w = write(fd, buf + done, len - done);
++        if (w < 0) {
++            if (errno == EINTR) continue;
++            return -1;
++        }
++        if (w == 0) return -1;
++        done += (size_t)w;
++    }
++    return 0;
++}
+ 
+-    fd = open(fifo_name, O_RDONLY);
+-    read(fd, buffer_fifo, 1024);
+-    close(fd);
++// 诊断镜像：存在触发文件 /tmp/sd/p9-mirror-on 时，把写入 FIFO 的每帧原样
++// 镜像到 /tmp/sd/p9-mirror.h264（上限 24MB 后自动关闭），用于对比
++// 「grabber 写出的字节」与「RTSP 出口的字节」。默认关闭，不影响稳态运行。
++#define P9_MIRROR_TRIGGER "/tmp/sd/p9-mirror-on"
++#define P9_MIRROR_PATH    "/tmp/sd/p9-mirror.h264"
++#define P9_MIRROR_LIMIT   (24u * 1024 * 1024)
++static int gMirrorFd = -1;
++static unsigned gMirrorBytes = 0;
+ 
++static void mirror_open_if_triggered(void)
++{
++    // 修复(P11b)：high / AUDIO 两个 grabber 进程会同时看到触发文件，
++    // 原实现对同一个路径各自 O_TRUNC 并用独立 fd 写入，视频与音频字节
++    // 互相覆盖交错，镜像本身变成脏数据。按 PID 分文件即可干净对照。
++    if (access(P9_MIRROR_TRIGGER, F_OK) == 0) {
++        char path[128];
++        snprintf(path, sizeof(path), "%s.%d", P9_MIRROR_PATH, (int)getpid());
++        gMirrorFd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++    }
++}
++
++static void mirror_write(const unsigned char *buf, unsigned len)
++{
++    if (gMirrorFd < 0) return;
++    if (gMirrorBytes + len > P9_MIRROR_LIMIT) {
++        close(gMirrorFd);
++        gMirrorFd = -1;
++        return;
++    }
++    if (write_all(gMirrorFd, buf, len) == 0)
++        gMirrorBytes += len;
++}
++
++void* unlock_fifo_thread(void *data)
++{
++    // 修复(P9)：原实现 open(O_RDONLY) 后 read 1024 字节再 close——
++    // 这会从码流里偷走最先写入 FIFO 的 1024 字节，导致 grabber 启动后
++    // 第一段码流字节错位（裸流里偶发的垃圾 NALU、重启后起播绿屏放大）。
++    // 改为非阻塞打开后立即关闭：只为让写端的 open() 不阻塞，不消费任何数据。
++    int fd = open((char *) data, O_RDONLY | O_NONBLOCK);
++    if (fd >= 0)
++        close(fd);
++
+     return NULL;
+ }
+ 
+@@ -516,6 +572,9 @@
+         }
+         fOut = stdout;
+     } else {
++        // 诊断镜像（P9）：按触发文件决定是否开启
++        mirror_open_if_triggered();
++
+         sigaction(SIGPIPE, &(struct sigaction){{sigpipe_handler}}, NULL);
+ 
+         if (resolution == RESOLUTION_LOW) {
+@@ -649,9 +708,12 @@
+                                 (((int) *(record_ptr + frame_length_offset + 1)) << 8) +
+                                 ((int) *(record_ptr + frame_length_offset));
+                     if (debug) fprintf(stderr, "%lld - writing frame: frame_counter %d, frame_offset %d, frame_ptr %08x, frame_length %d\n", current_timestamp(), frame_counter, frame_offset, (unsigned int) frame_ptr, frame_length);
+-                    // Write the frame
+-                    fwrite(frame_ptr, 1, frame_length, fOut);
+-                    fflush(fOut);
++                    // 修复(P9)：裸 fd + write_all() 原子写，替代 stdio fwrite+fflush。
++                    if (write_all(fileno(fOut), frame_ptr, frame_length) != 0) {
++                        if (debug) fprintf(stderr, "%lld - write_all failed, errno %d\n", current_timestamp(), errno);
++                    }
++                    // 诊断镜像（P9）：对比 grabber 写出的字节与 RTSP 出口的字节
++                    mirror_write(frame_ptr, frame_length);
+ 
+                     // Check if we are at the end of the table
+                     if (current_frame == table_record_num - 1) {
+@@ -751,9 +813,10 @@
+                                 (((int) *(record_ptr + frame_length_offset + 1)) << 8) +
+                                 ((int) *(record_ptr + frame_length_offset));
+                     if (debug) fprintf(stderr, "%lld - writing frame: frame_ts %u, frame_offset %d, frame_ptr %08x, frame_length %d\n", current_timestamp(), frame_ts, frame_offset, (unsigned int) frame_ptr, frame_length);
+-                    // Write the frame
+-                    fwrite(frame_ptr, 1, frame_length, fOut);
+-                    fflush(fOut);
++                    // 修复(P9)：音频同样改为裸 fd + write_all() 原子写。
++                    if (write_all(fileno(fOut), frame_ptr, frame_length) != 0) {
++                        if (debug) fprintf(stderr, "%lld - write_all failed, errno %d\n", current_timestamp(), errno);
++                    }
+ 
+                     // Check if we are at the end of the table
+                     if (current_frame == table_record_num - 1) {

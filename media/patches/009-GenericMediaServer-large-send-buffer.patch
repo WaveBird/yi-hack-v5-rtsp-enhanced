@@ -1,0 +1,22 @@
+--- a/liveMedia/GenericMediaServer.cpp
++++ b/liveMedia/GenericMediaServer.cpp
+@@ -242,7 +242,18 @@
+   }
+   ignoreSigPipeOnSocket(clientSocket); // so that clients on the same host that are killed don't also kill us
+   makeSocketNonBlocking(clientSocket);
+-  increaseSendBufferTo(envir(), clientSocket, 50*1024);
++  // 加固(P11a)：上游只要求 50KB 发送缓冲，而相机 net.core.wmem_default/max
++  // 都是 163840（160KB，约 1.2 秒码率）。消费端一次 >1s 抖动就会填满缓冲，
++  // 触发 RTPInterface 的部分写 -> 阻塞补发 -> 干净断链 -> 客户端重连 ->
++  // 新会话从 GOP 中间起播（绿屏/竖向拉丝）。这里把每个 RTSP/TCP 连接的
++  // 发送缓冲提升到 512KB（约 4 秒码率）；wmem_max 由 rRTSPServer main()
++  // 预先提升到 1MB，否则 setsockopt 会被内核静默截断回 160KB。
++  // 内存代价按需发生（sk_buff 只在真正排队时分配），单机通常只有 1 个客户端。
++  {
++    unsigned sndBufBytes = 512*1024;
++    (void)setsockopt(clientSocket, SOL_SOCKET, SO_SNDBUF,
++                     (const char*)&sndBufBytes, sizeof sndBufBytes);
++  }
+ 
+   // 加固(P3)：启用 TCP keepalive 收割半开连接。
+   // 场景：客户端(经 WiFi)异常消失且无 FIN/RST 时，旧会话永久存活并因

@@ -1,0 +1,44 @@
+--- a/liveMedia/StreamParser.cpp
++++ b/liveMedia/StreamParser.cpp
+@@ -25,6 +25,21 @@
+ 
+ #define BANK_SIZE 150000
+ 
++// 加固(P13)：parser 每次向输入源申请的缓冲是
++//   maxNumBytesToRead = BANK_SIZE - fTotNumValidBytes
++// 在 bank 快满时这个数可能只剩几百字节。P2 的 StreamReplicator 会把同一个
++// 帧复制到所有副本，任何一个副本的 fMaxSize 小于帧长，
++// StreamReplica::copyReceivedFrame() 就会**静默截断**尾部字节；
++// StreamParser::afterGettingBytes() 又忽略 numTruncatedBytes，于是 H264
++// 字节流里凭空缺一段，I 帧被削 -> 解码器 concealment -> 绿屏 / 竖向拉丝。
++//
++// 现场同窗 A/B：P11 有 34/40 个 IDR 被削（最多 -17496B）；P12 把 FIFO 读块
++// 限到 4096B 后降到 10/43（最多 -3329B），残留全部来自 bank 尾部空间不足。
++// 这里在剩余空间 < 8192B 时提前轮换 bank，保证 parser 申请的缓冲恒 >= 8192B；
++// 配合 ByteStreamFifoSource 的 4096B 读块上限，copyReceivedFrame() 永远
++// 不需要截断。8192 取 2 倍余量，覆盖 bank 轮换后仍需保存大帧的场景。
++#define RRTSP_PARSER_MIN_READ_ROOM 8192
++
+ void StreamParser::flushInput() {
+   fCurParserIndex = fSavedParserIndex = 0;
+   fSavedRemainingUnparsedBits = fRemainingUnparsedBits = 0;
+@@ -126,7 +141,10 @@
+ 
+   // First, check whether these new bytes would overflow the current
+   // bank.  If so, start using a new bank now.
+-  if (fCurParserIndex + numBytesNeeded > BANK_SIZE) {
++  // 加固(P13)：除了原有的「解析位置越界」条件，bank 剩余空间不足时也提前
++  // 轮换，避免向 StreamReplica 申请一个过小的缓冲（见文件头注释）。
++  if (fCurParserIndex + numBytesNeeded > BANK_SIZE ||
++      BANK_SIZE - fTotNumValidBytes < RRTSP_PARSER_MIN_READ_ROOM) {
+     // Swap banks, but save any still-needed bytes from the old bank:
+     unsigned numBytesToSave = fTotNumValidBytes - fSavedParserIndex;
+     unsigned char const* from = &curBank()[fSavedParserIndex];
+@@ -153,6 +171,7 @@
+ 
+   // Try to read as many new bytes as will fit in the current bank:
+   unsigned maxNumBytesToRead = BANK_SIZE - fTotNumValidBytes;
++  if (maxNumBytesToRead == 0) maxNumBytesToRead = 1; // 防御：绝不申请 0 字节读
+   fInputSource->getNextFrame(&curBank()[fTotNumValidBytes],
+ 			     maxNumBytesToRead,
+ 			     afterGettingBytes, this,

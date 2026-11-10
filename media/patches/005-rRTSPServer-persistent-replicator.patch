@@ -1,0 +1,234 @@
+--- a/src/rRTSPServer.cpp
++++ b/src/rRTSPServer.cpp
+@@ -25,7 +25,9 @@
+ #include "ADTSAudioFifoServerMediaSubsession.hh"
+ #include "ADTSAudioFifoSource.hh"
+ #include "H264VideoFifoServerMediaSubsession.hh"
++#include "ByteStreamFifoSource.hh" // 加固(P2)：常驻视频源
+ 
++#include <stdio.h> // fdopen/fclose/fprintf (P2)
+ #include <sys/stat.h>
+ #include <getopt.h>
+ #include <errno.h>
+@@ -235,6 +237,82 @@
+     return replicator;
+ }
+ 
++// ===== 加固(P2)：视频进程级常驻 StreamReplicator =====
++// 原实现：每个 ServerMediaSubsession 在首个客户端到来时 createNewStreamSource()
++// 新建 ByteStreamFifoSource（open FIFO + 清空残留）；最后一个客户端断开后源被销毁，
++// FIFO 读端关闭，h264grabber 写端失去消费者。P4v2 拆除楔死会话后必须等
++// go2rtc 重连 + FIFO 重新 open + SPS 重新解析，形成 8-10s 断流窗口。
++//
++// 改成：进程启动时一次性建立 ByteStreamFifoSource + StreamReplicator(False)，
++// 并挂一个永不退出的 DummySink replica 保持源持续读 FIFO。客户端会话只持有
++// 独立 replica，拆除时仅回收 replica，底层源与 FIFO 读端始终存活。
++// 于是重连后新 replica 立即拿到当前帧，恢复窗口缩短到只有 RTSP 重连本身。
++// 自持的 FIFO 写端（进程级常驻，故意不 close）。
++// POSIX FIFO 在所有写端都关闭时 read() 返回 0，ByteStreamFifoSource 会当作永久 EOF
++// 调用 handleClosure() —— 常驻源一旦关闭就再也不会重建，会变成永久断流。
++// 自己保留一个不写数据的写端，可保证 h264grabber 重启期间 read() 只会返回 EAGAIN
++// （P1 补丁已处理），而永远不会走 EOF 分支。
++static int gFifoKeepaliveWriteFd[2] = { -1, -1 };
++static int gFifoKeepaliveIndex = 0;
++
++// 冷启动时 h264grabber 可能还没来得及 mkfifo。原实现是「首个客户端到来时」才 open，
++// 天然规避了启动顺序；常驻源改为启动时 open 后就必须显式等待，否则会 fallback
++// 回旧的每会话源，P2 等于白做。最多等 5s，超时仍回退（服务不中断）。
++static void waitForFifo(char const* fifoName) {
++    struct stat st;
++    for (int i = 0; i < 50; ++i) {
++        if (stat(fifoName, &st) == 0 && S_ISFIFO(st.st_mode)) return;
++        usleep(100000); // 100ms
++    }
++}
++
++static StreamReplicator* startVideoReplicator(char const* fifoName, char const* tag) {
++    waitForFifo(fifoName);
++    // 不用 ByteStreamFifoSource::createNew(env, fileName, ...)：它内部以阻塞方式
++    // fopen FIFO，若此刻 h264grabber 写端还没打开会卡死整个进程启动。
++    // 这里先 O_NONBLOCK 打开，再走已有的 FILE* 重载；构造函数仍会把 fd 设为非阻塞。
++    int fd = open(fifoName, O_RDONLY | O_NONBLOCK);
++    if (fd < 0) {
++        hardenedLog("P2: cannot open %s (errno=%d); falling back to per-session source", fifoName, errno);
++        return NULL;
++    }
++    FILE* fid = fdopen(fd, "rb");
++    if (fid == NULL) {
++        close(fd);
++        hardenedLog("P2: fdopen failed for %s; falling back to per-session source", fifoName);
++        return NULL;
++    }
++    // 读端已在手，此刻以非阻塞方式再开一个写端必然成功（不会 ENXIO）。
++    if (gFifoKeepaliveIndex < 2) {
++        int wfd = open(fifoName, O_WRONLY | O_NONBLOCK);
++        if (wfd >= 0) gFifoKeepaliveWriteFd[gFifoKeepaliveIndex++] = wfd;
++        else hardenedLog("P2: keepalive write fd failed for %s (errno=%d)", fifoName, errno);
++    }
++    ByteStreamFifoSource* src = ByteStreamFifoSource::createNew(*env, fid, 0, 50000);
++    if (src == NULL) {
++        fclose(fid);
++        hardenedLog("P2: cannot create source for %s; falling back to per-session source", fifoName);
++        return NULL;
++    }
++    // deleteWhenLastReplicaDies=False 是关键：默认 True 会在全部客户端断开后
++    // 自删 replicator（连带关闭输入源），常驻化就失效了。
++    StreamReplicator* replicator = StreamReplicator::createNew(*env, src, False);
++    FramedSource* dummyReplica = replicator->createStreamReplica();
++    MediaSink* dummySink = DummySink::createNew(*env, tag);
++    dummySink->startPlaying(*dummyReplica, NULL, NULL);
++    hardenedLog("P2: persistent replicator ready for %s", fifoName);
++    return replicator;
++}
++
++// 复制器创建失败时优雅退回原有的每会话源路径（不中断服务）。
++static H264VideoFifoServerMediaSubsession* makeVideoSubsession(StreamReplicator* replicator,
++                                                               char const* fifoName) {
++    if (replicator != NULL)
++        return H264VideoFifoServerMediaSubsession::createNew(*env, replicator, reuseFirstSource);
++    return H264VideoFifoServerMediaSubsession::createNew(*env, fifoName, reuseFirstSource);
++}
++// ===== 加固(P2) 结束 =====
++
+ static void announceStream(RTSPServer* rtspServer, ServerMediaSession* sms,
+                                 char const* streamName, char const* inputFileName, int audio) {
+     char* url = rtspServer->rtspURL(sms);
+@@ -498,6 +576,15 @@
+     // First, make sure that the RTPSinks' buffers will be large enough to handle the huge size of DV frames (as big as 288000).
+     OutPacketBuffer::maxSize = 262144;
+ 
++    // 加固(P2)：在注册任何 ServerMediaSession 之前建立常驻视频复制器。
++    // 每路分辨率一个；创建失败时 makeVideoSubsession() 自动回退到旧的每会话源。
++    StreamReplicator* videoReplicatorHigh = NULL;
++    StreamReplicator* videoReplicatorLow = NULL;
++    if ((resolution == RESOLUTION_HIGH) || (resolution == RESOLUTION_BOTH))
++        videoReplicatorHigh = startVideoReplicator("/tmp/h264_high_fifo", "high-dummy");
++    if ((resolution == RESOLUTION_LOW) || (resolution == RESOLUTION_BOTH))
++        videoReplicatorLow = startVideoReplicator("/tmp/h264_low_fifo", "low-dummy");
++
+     // Set up each of the possible streams that can be served by the
+     // RTSP server.  Each such stream is implemented using a
+     // "ServerMediaSession" object, plus one or more
+@@ -512,8 +599,7 @@
+         ServerMediaSession* sms_high
+             = ServerMediaSession::createNew(*env, streamName, streamName,
+                                     descriptionString);
+-        sms_high->addSubsession(H264VideoFifoServerMediaSubsession
+-                                ::createNew(*env, inputFileName, reuseFirstSource));
++        sms_high->addSubsession(makeVideoSubsession(videoReplicatorHigh, inputFileName)); // 加固(P2)
+         if (audio == 1) {
+             sms_high->addSubsession(ADTSAudioFifoServerMediaSubsession
+                                        ::createNew(*env, replicator, reuseFirstSource));
+@@ -533,8 +619,7 @@
+         ServerMediaSession* sms_low
+         = ServerMediaSession::createNew(*env, streamName, streamName,
+                                 descriptionString);
+-        sms_low->addSubsession(H264VideoFifoServerMediaSubsession
+-                                ::createNew(*env, inputFileName, reuseFirstSource));
++        sms_low->addSubsession(makeVideoSubsession(videoReplicatorLow, inputFileName)); // 加固(P2)
+         if (audio == 1) {
+             sms_low->addSubsession(ADTSAudioFifoServerMediaSubsession
+                                         ::createNew(*env, replicator, reuseFirstSource));
+@@ -581,7 +666,7 @@
+     /* gRTPSendErrorHook = rtpSendErrorHook; */
+ 
+     // 加固(P4v2)：启动 FIFO 无消费巡检
+-    hardenedLog("hardened rRTSPServer starting (P1/P3/P4/P4v2), pid=%d, sigpipe=ignored", getpid());
++    hardenedLog("hardened rRTSPServer starting (P1/P2/P3/P4/P4v2), pid=%d, sigpipe=ignored", getpid());
+     scheduleHealthCheck();
+ 
+     env->taskScheduler().doEventLoop(); // does not return
+--- a/src/H264VideoFifoServerMediaSubsession.cpp
++++ b/src/H264VideoFifoServerMediaSubsession.cpp
+@@ -25,6 +25,7 @@
+ #include "H264VideoStreamFramer.hh"
+ #include "H264VideoStreamFramer.hh"
+ #include "ByteStreamFifoSource.hh"
++#include "StreamReplicator.hh" // 加固(P2)
+ 
+ H264VideoFifoServerMediaSubsession*
+ H264VideoFifoServerMediaSubsession::createNew(UsageEnvironment& env,
+@@ -33,12 +34,27 @@
+     return new H264VideoFifoServerMediaSubsession(env, fileName, reuseFirstSource);
+ }
+ 
++// 加固(P2)：常驻复制器版本。subsession 本身随 ServerMediaSession 常驻，
++// 这里只保存 replicator 指针；每个客户端会话在 createNewStreamSource() 里取一个 replica。
++H264VideoFifoServerMediaSubsession*
++H264VideoFifoServerMediaSubsession::createNew(UsageEnvironment& env,
++                                              StreamReplicator* replicator,
++                                              Boolean reuseFirstSource) {
++    return new H264VideoFifoServerMediaSubsession(env, replicator, reuseFirstSource);
++}
++
+ H264VideoFifoServerMediaSubsession::H264VideoFifoServerMediaSubsession(UsageEnvironment& env,
+                                                                        char const* fileName, Boolean reuseFirstSource)
+     : FileServerMediaSubsession(env, fileName, reuseFirstSource),
+-      fAuxSDPLine(NULL), fDoneFlag(0), fDummyRTPSink(NULL) {
++      fAuxSDPLine(NULL), fDoneFlag(0), fDummyRTPSink(NULL), fReplicator(NULL) {
+ }
+ 
++H264VideoFifoServerMediaSubsession::H264VideoFifoServerMediaSubsession(UsageEnvironment& env,
++                                                                       StreamReplicator* replicator, Boolean reuseFirstSource)
++    : FileServerMediaSubsession(env, "persistent-replicator", reuseFirstSource),
++      fAuxSDPLine(NULL), fDoneFlag(0), fDummyRTPSink(NULL), fReplicator(replicator) {
++}
++
+ H264VideoFifoServerMediaSubsession::~H264VideoFifoServerMediaSubsession() {
+     delete[] fAuxSDPLine;
+ }
+@@ -105,6 +121,17 @@
+ FramedSource* H264VideoFifoServerMediaSubsession::createNewStreamSource(unsigned /*clientSessionId*/, unsigned& estBitrate) {
+     estBitrate = 500; // kbps, estimate
+ 
++    // 加固(P2)：优先使用常驻复制器。
++    // 原实现每次会话都新建 ByteStreamFifoSource（重新 open + 清空 FIFO），
++    // 客户端全部断开后源被销毁，重建时 h264grabber 写端失去读者，
++    // 造成 8-10s 的断流窗口。改用 replica 后：会话销毁只回收 replica，
++    // 底层 FIFO 源与 dummy 消费者始终存活，重连即可立刻拿到当前帧。
++    if (fReplicator != NULL) {
++        fFileSize = 0;
++        FramedSource* replica = fReplicator->createStreamReplica();
++        return H264VideoStreamFramer::createNew(envir(), replica);
++    }
++
+     // Create the video source:
+     ByteStreamFifoSource* fileSource = ByteStreamFifoSource::createNew(envir(), fFileName, 0, 50000);
+     if (fileSource == NULL) return NULL;
+--- a/include/H264VideoFifoServerMediaSubsession.hh
++++ b/include/H264VideoFifoServerMediaSubsession.hh
+@@ -26,11 +26,17 @@
+ #include "FileServerMediaSubsession.hh"
+ #endif
+ 
++class StreamReplicator; // 加固(P2)：前向声明，完整定义在 .cpp 中引入
++
+ class H264VideoFifoServerMediaSubsession: public FileServerMediaSubsession {
+ public:
+     static H264VideoFifoServerMediaSubsession*
+     createNew(UsageEnvironment& env, char const* fileName, Boolean reuseFirstSource);
+ 
++    // 加固(P2)：使用进程级常驻 StreamReplicator（会话拆除不销毁底层 FIFO 源）
++    static H264VideoFifoServerMediaSubsession*
++    createNew(UsageEnvironment& env, StreamReplicator* replicator, Boolean reuseFirstSource);
++
+     // Used to implement "getAuxSDPLine()":
+     void checkForAuxSDPLine1();
+     void afterPlayingDummy1();
+@@ -38,6 +44,8 @@
+ protected:
+     H264VideoFifoServerMediaSubsession(UsageEnvironment& env,
+                                        char const* fileName, Boolean reuseFirstSource);
++    H264VideoFifoServerMediaSubsession(UsageEnvironment& env,
++                                       StreamReplicator* replicator, Boolean reuseFirstSource);
+     // called only by createNew();
+     virtual ~H264VideoFifoServerMediaSubsession();
+ 
+@@ -56,6 +64,7 @@
+     char* fAuxSDPLine;
+     char fDoneFlag; // used when setting up "fAuxSDPLine"
+     RTPSink* fDummyRTPSink; // ditto
++    StreamReplicator* fReplicator; // 加固(P2)：非 NULL 时由常驻复制器提供每个会话的 replica
+ };
+ 
+ #endif

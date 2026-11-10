@@ -1,0 +1,374 @@
+--- a/liveMedia/RTPInterface.cpp
++++ b/liveMedia/RTPInterface.cpp
+@@ -47,12 +47,32 @@
+ // 配套 P11a：accept 时把 SO_SNDBUF 从 160KB 提升到 512KB，并把
+ // net.core.wmem_max 提升到 1MB（rRTSPServer main() 完成），把绝大多数
+ // 抖动直接吸收在内核缓冲里，用户态队列只在极端情况下才被用到。
+-// 兜底：队列超限或拥塞持续 >6s，说明消费端确实死了，仍走 P5 干净断链。
++// 兜底（P18 前）：队列超限或拥塞持续 >6s 即断链。
++//
++// ===== 加固(P18)：拥塞「丢帧不断链」=====
++// 现场反证（2026-11-08 11:38-11:49 UTC，logs/p17-evidence/）：
++//   P11 队列涨到 192KB 上限 -> reason=4 主动 shutdown(SHUT_RDWR)
++//   -> go2rtc unexpected EOF -> Frigate bad cseq / watchdog 重启
++//   -> 录像出现短秒级可见断流，音轨相位漂移 56.57s、容器膨胀到 67s。
++// P14b/P15/P16/P17 四轮消费端时间戳补丁都只是在替这个「主动断链」擦屁股，
++// 且每轮都引入新的相位/时长副作用。P18 把修复放回源头：
++//   * 队列上限 192KB -> 512KB，吸收数秒 Wi-Fi / 消费端抖动；
++//   * 队列满时按 4 字节 interleaved 帧边界丢弃「最老的整帧」，
++//     并让保留下来的队首落在完整 NAL 起点（FU-A 的 S 位 / 单 NAL），
++//     解码器只会缺几个 NAL、不会收到残缺 NAL -> 不产生绿屏 / 拉丝；
++//   * 保持 TCP 连接与交织流对齐，客户端不重连、不从 GOP 中间起播；
++//   * 只有 send() 硬错误（EPIPE/ECONNRESET）或「连续 30s 一个字节都
++//     没发出去」才走 P5 干净断链 —— 真正死连接仍可回收。
++// 用户验收口径：「允许缺少一些帧，但是不能短秒」。生产侧 P15 的
++// -bsf:v setts=pts=N/(20*TB) 会把「实际送达包数」重写成 20fps CFR，
++// 因此少量丢帧在 mp4 里表现为画面跳过数帧，而不是秒级时间空洞。
+ #include <sys/time.h>
+ #include <sys/types.h>
+ // 取证钩子由应用层 rRTSPServer.cpp 提供（文件后部还有一处等价声明）。
+ extern "C" void rrtspTcpFailureNotify(int socketNum, int reason, unsigned sendResult);
+ extern "C" void rrtspTcpDropNotify(int socketNum, unsigned char channel, unsigned packetSize);
++// 加固(P18)：主动丢帧但保持连接时打点（节流）。
++extern "C" void rrtspTcpDropFrameNotify(int socketNum, unsigned frames, unsigned bytes);
+ #ifndef MSG_NOSIGNAL
+ #define MSG_NOSIGNAL 0x4000
+ #endif
+@@ -62,18 +82,23 @@
+ 
+ #define RRTSP_OUTQ_MAX_FLOWS   8
+ #define RRTSP_OUTQ_INIT_CAP    (32*1024)
+-#define RRTSP_OUTQ_MAX_CAP     (192*1024)
+-#define RRTSP_OUTQ_MAX_AGE_MS  6000
++#define RRTSP_OUTQ_MAX_CAP     (512*1024)  // P18: 192KB -> 512KB
++#define RRTSP_OUTQ_MAX_AGE_MS  30000       // P18: 6000 -> 30000（仅零进展才计龄）
+ #define RRTSP_OUTQ_RETRY_US    10000
++#define RRTSP_OUTQ_MAX_DROP    4096        // 单次丢帧防御上限
+ 
+ struct RrtspOutq {
+   int sock;
+   Boolean used;
+   u_int8_t* buf;
+   unsigned cap, head, len;
++  // 加固(P18)：队首当前帧已成功发出的字节数。head 永远指向完整帧头，
++  // 部分写只推进 frameOff，因此丢帧时队首始终按 4 字节帧头解析。
++  unsigned frameOff;
+   struct sockaddr_storage peer;
+   socklen_t peerLen;
+   struct timeval blockedSince;
++  struct timeval lastProgress;  // 最近一次 send() 真正写出字节的时刻
+   Boolean blocked;
+ };
+ 
+@@ -118,22 +143,91 @@
+   if (slot->buf == NULL) return NULL;
+   slot->sock = sock;
+   slot->used = True;
++  gettimeofday(&slot->lastProgress, NULL); // P18: 零进展计龄起点
+   return slot;
+ }
+ 
+ // 返回 1=已排空, 0=内核缓冲满(稍后重试), -1=硬错误(需断链)
++// 加固(P18)：按「整帧」发送。head 只在整帧发完后前进；frameOff 记住本帧
++// 已发出的字节数，因此 EAGAIN 之后重发不会重复已发部分，且队列头部永远
++// 是一个完整的 '$' 交错帧头 —— 这是按帧边界安全丢帧的前提。
+ static int rrtspOutqDrain(RrtspOutq* q) {
+   while (q->len > 0) {
+-    ssize_t w = send(q->sock, (char const*)(q->buf + q->head), q->len,
+-                     MSG_DONTWAIT | MSG_NOSIGNAL);
+-    if (w > 0) { q->head += (unsigned)w; q->len -= (unsigned)w; continue; }
+-    if (w < 0 && errno == EINTR) continue;
+-    if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+-    return -1;
++    if (q->len < 4) return -1;
++    u_int8_t* fh = q->buf + q->head;
++    if (fh[0] != '$') return -1;                 // 帧对齐断言
++    unsigned frameLen = 4u + ((unsigned)fh[2] << 8) + (unsigned)fh[3];
++    if (frameLen < 4 || frameLen > q->len) return -1;
++    while (q->frameOff < frameLen) {
++      ssize_t w = send(q->sock, (char const*)(fh + q->frameOff),
++                       frameLen - q->frameOff, MSG_DONTWAIT | MSG_NOSIGNAL);
++      if (w > 0) {
++        q->frameOff += (unsigned)w;
++        gettimeofday(&q->lastProgress, NULL);
++        continue;
++      }
++      if (w < 0 && errno == EINTR) continue;
++      if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
++      return -1;
++    }
++    q->head += frameLen;
++    q->len  -= frameLen;
++    q->frameOff = 0;
+   }
+   q->head = 0;
++  q->frameOff = 0;
+   q->blocked = False;
+   return 1;
++}
++
++// 加固(P18)：判断一个已入队的 RTP 包是否为「完整 NAL 单元的起点」。
++// 单 NAL(type 1..23) / 聚合包(24..27) 总是起点；FU-A/FU-B(28/29)
++// 仅当 FU header 的 S 位为 1 时才是起点。解析不了就保守视为起点，
++// 避免误判把整队数据丢光。
++static Boolean rrtspOutqIsNalStart(u_int8_t const* p, unsigned len) {
++  if (len < 13 || (p[0] & 0xC0) != 0x80) return True;
++  unsigned hdr = 12u + 4u * (unsigned)(p[0] & 0x0F);  // 固定头 + CSRC
++  if ((p[0] & 0x10) != 0) {                           // X: RTP 扩展头
++    if (hdr + 4 > len) return True;
++    unsigned extWords = ((unsigned)p[hdr + 2] << 8) | (unsigned)p[hdr + 3];
++    hdr += 4u + 4u * extWords;
++  }
++  if (hdr >= len) return True;
++  u_int8_t nalType = p[hdr] & 0x1F;
++  if (nalType == 28 || nalType == 29) {
++    if (hdr + 1 >= len) return True;
++    return (p[hdr + 1] & 0x80) != 0;                  // FU S bit
++  }
++  return True;
++}
++
++// 加固(P18)：队列满时丢弃「最老的整帧」，直到腾出 need 字节，并让
++// 保留下来的队首恰好落在完整 NAL 起点。丢弃边界永远在 4 字节帧头上，
++// 客户端只会缺几个完整 NAL，永远不会收到半个 NAL -> 不绿屏 / 不拉丝。
++// 返回丢弃帧数；0 表示队首帧已部分发出、当前不能安全丢帧。
++static unsigned rrtspOutqDropOldest(RrtspOutq* q, unsigned need,
++                                    unsigned* droppedBytes) {
++  if (droppedBytes != NULL) *droppedBytes = 0;
++  if (q->frameOff != 0 || q->len < 4) return 0;
++  unsigned dropped = 0, bytes = 0;
++  while (q->len > 0 && dropped < RRTSP_OUTQ_MAX_DROP) {
++    u_int8_t* fh = q->buf + q->head;
++    if (fh[0] != '$' || q->len < 4) break;
++    unsigned frameLen = 4u + ((unsigned)fh[2] << 8) + (unsigned)fh[3];
++    if (frameLen < 4 || frameLen > q->len) {   // 异常：整队清空，但保持连接
++      q->head = 0; q->len = 0; q->frameOff = 0; q->blocked = False;
++      break;
++    }
++    if (q->len + need <= RRTSP_OUTQ_MAX_CAP &&
++        rrtspOutqIsNalStart(fh + 4, frameLen - 4)) break;
++    q->head += frameLen;
++    q->len  -= frameLen;
++    bytes   += frameLen;
++    dropped++;
++  }
++  if (q->len == 0) { q->head = 0; q->frameOff = 0; q->blocked = False; }
++  if (droppedBytes != NULL) *droppedBytes = bytes;
++  return dropped;
+ }
+ 
+ static Boolean rrtspOutqAppend(RrtspOutq* q, u_int8_t const* hdr,
+@@ -145,6 +239,8 @@
+     if (q->len + need > q->cap) {
+       unsigned newCap = q->cap;
+       while (newCap < q->len + need && newCap < RRTSP_OUTQ_MAX_CAP) newCap *= 2;
++      // 加固(P18)：原来 newCap 可能越过 MAX_CAP 却不钳制，等于上限失效。
++      if (newCap > RRTSP_OUTQ_MAX_CAP) newCap = RRTSP_OUTQ_MAX_CAP;
+       if (q->len + need > newCap) return False;
+       u_int8_t* nb = new u_int8_t[newCap];
+       if (nb == NULL) return False;
+@@ -176,12 +272,27 @@
+     if (!rrtspOutqPeerMatches(q)) { rrtspOutqRelease(q); continue; }
+     int r = rrtspOutqDrain(q);
+     if (r < 0) {
++      // 硬错误（EPIPE / ECONNRESET / 帧对齐断言失败）：对端已不存在，
++      // 保留 P5 干净断链语义，避免留下半死不活的 TCP 连接。
+       rrtspTcpFailureNotify(q->sock, 5, 0);
+       shutdown(q->sock, SHUT_RDWR);
+       rrtspOutqRelease(q);
+       continue;
+     }
+-    if (q->len > 0) any = True;
++    if (q->len > 0) {
++      // 加固(P18)：只有「连续 30 秒一个字节都没发出去」才判真死连接。
++      // 有进展就只重排、不断链 —— 这正是消除短秒断流的关键。
++      struct timeval now; gettimeofday(&now, NULL);
++      long stallMs = (long)(now.tv_sec - q->lastProgress.tv_sec) * 1000
++                   + (now.tv_usec - q->lastProgress.tv_usec) / 1000;
++      if (q->lastProgress.tv_sec != 0 && stallMs > RRTSP_OUTQ_MAX_AGE_MS) {
++        rrtspTcpFailureNotify(q->sock, 6, q->len);
++        shutdown(q->sock, SHUT_RDWR);
++        rrtspOutqRelease(q);
++        continue;
++      }
++      any = True;
++    }
+   }
+   if (any) rrtspOutqScheduleRetry();
+ }
+@@ -502,9 +613,11 @@
+ 
+ ////////// Helper Functions - Implementation /////////
+ 
+-// 加固(P5)/加固(P7)：取证钩子，由应用层 rRTSPServer.cpp 提供（用 open/write 写日志，不用 stdio）。
++// 加固(P5)/加固(P7)/加固(P18)：取证钩子，由应用层 rRTSPServer.cpp 提供
++//（用 open/write 写日志，不用 stdio；声明与文件前部等价）。
+ extern "C" void rrtspTcpFailureNotify(int socketNum, int reason, unsigned sendResult);
+ extern "C" void rrtspTcpDropNotify(int socketNum, unsigned char channel, unsigned packetSize);
++extern "C" void rrtspTcpDropFrameNotify(int socketNum, unsigned frames, unsigned bytes);
+ 
+ // 加固(P6)：把 P5 的 200ms 放宽到 1000ms（上游原值 500ms）。
+ // 200ms 在相机 Wi-Fi 上排不空瞬时拥塞的 TCP 发送缓冲，导致每一次
+@@ -569,13 +682,31 @@
+   }
+ 
+   // 2) 完整追加本帧。
++  // 加固(P18)：容量不足时按帧边界丢弃「最老的整帧」腾出空间再追加，
++  // 不再 shutdown。丢帧边界落在完整 NAL 起点，客户端只缺几个完整 NAL。
++  unsigned need = 4 + packetSize;
+   if (!rrtspOutqAppend(q, framingHeader, packet, packetSize)) {
+-    rrtspTcpDropNotify(socketNum, streamChannelId, q->len);
+-    rrtspTcpFailureNotify(socketNum, 4, q->len);
+-    shutdown(socketNum, SHUT_RDWR);
+-    removeStreamSocket(socketNum, 0xFF);
+-    rrtspOutqRelease(q);
+-    return False;
++    unsigned droppedBytes = 0;
++    unsigned dropped = rrtspOutqDropOldest(q, need, &droppedBytes);
++    if (dropped > 0) {
++      rrtspTcpDropFrameNotify(socketNum, dropped, droppedBytes);
++      int dr = rrtspOutqDrain(q);   // head 已前移，先再排一次
++      if (dr < 0) {
++        rrtspTcpFailureNotify(socketNum, 3, 0);
++        shutdown(socketNum, SHUT_RDWR);
++        removeStreamSocket(socketNum, 0xFF);
++        rrtspOutqRelease(q);
++        return False;
++      }
++    }
++    if (!rrtspOutqAppend(q, framingHeader, packet, packetSize)) {
++      // 极端情形：单帧大于队列上限，或队首帧已部分发出暂时不能丢。
++      // 只丢弃「当前这个新帧」，绝不因为拥塞断开连接。
++      rrtspTcpDropNotify(socketNum, streamChannelId, packetSize);
++      rrtspTcpDropFrameNotify(socketNum, 1, need);
++      rrtspOutqScheduleRetry();
++      return True;
++    }
+   }
+ 
+   // 3) 立刻排空：正常路径零额外延迟、零拷贝以外的开销。
+@@ -589,21 +720,18 @@
+   }
+   if (q->len == 0) return True;
+ 
+-  // 4) 拥塞态：不阻塞、不断链，登记起点并安排 10ms 后台重排。
++  // 4) 拥塞态：不阻塞、不断链。
++  // 加固(P18)：队列接近上限时按帧边界丢最老的整帧；「连续 30s 零进展 =
++  // 真死连接」的唯一判定统一放在 rrtspOutqRetryTask()，避免两处计时口径
++  // 不一致。正常瞬时拥塞只会丢几帧，绝不再主动 shutdown。
+   if (!q->blocked) {
+     q->blocked = True;
+     gettimeofday(&q->blockedSince, NULL);
+   }
+-  struct timeval now; gettimeofday(&now, NULL);
+-  long ageMs = (long)(now.tv_sec - q->blockedSince.tv_sec) * 1000
+-             + (now.tv_usec - q->blockedSince.tv_usec) / 1000;
+-  if (ageMs > RRTSP_OUTQ_MAX_AGE_MS || q->len >= RRTSP_OUTQ_MAX_CAP) {
+-    // 消费端确实死了：保留 P5 干净断链语义，避免无限缓存。
+-    rrtspTcpFailureNotify(socketNum, 4, q->len);
+-    shutdown(socketNum, SHUT_RDWR);
+-    removeStreamSocket(socketNum, 0xFF);
+-    rrtspOutqRelease(q);
+-    return False;
++  if (q->len + need >= RRTSP_OUTQ_MAX_CAP) {
++    unsigned droppedBytes = 0;
++    unsigned dropped = rrtspOutqDropOldest(q, need, &droppedBytes);
++    if (dropped > 0) rrtspTcpDropFrameNotify(socketNum, dropped, droppedBytes);
+   }
+   rrtspTcpDropNotify(socketNum, streamChannelId, q->len); // 应用层节流打点
+   rrtspOutqScheduleRetry();
+@@ -628,7 +756,7 @@
+ #define RTPINTERFACE_BLOCKING_WRITE_TIMEOUT_MS 1000
+ #endif
+ 
+-// 加固(P7)/加固(P11)：取证钩子声明见文件前部。
++// 加固(P7)/加固(P11)/加固(P18)：取证钩子声明见文件前部。
+ 
+ Boolean RTPInterface::sendDataOverTCP(int socketNum, TLSState* tlsState,
+ 				      u_int8_t const* data, unsigned dataSize,
+--- a/src/rRTSPServer.cpp
++++ b/src/rRTSPServer.cpp
+@@ -150,6 +150,31 @@
+ }
+ // ===== 加固(P11) 结束 =====
+ 
++// ===== 加固(P18)：拥塞丢帧取证钩子（节流） =====
++// RTPInterface 在队列接近上限时按 NAL 边界丢弃「最老的整帧」，并且
++// 保持 TCP 连接。这是 P18 与 P11 的根本区别：P11 队列满会 shutdown，
++// P18 丢帧不断链 —— 客户端不重连、不从 GOP 中间起播，短秒断流消失。
++// 拥塞期间每帧都会回调，必须聚合成每秒一行：相机 /tmp 是 tmpfs，
++// MemFree 常仅 3-4MB，日志本身不能变成新负载。
++volatile unsigned gP18DropFrames = 0;
++extern "C" void rrtspTcpDropFrameNotify(int socketNum, unsigned frames, unsigned bytes) {
++    gP18DropFrames += frames;
++    static time_t lastLog = 0;
++    static unsigned framesSinceLog = 0;
++    static unsigned bytesSinceLog = 0;
++    framesSinceLog += frames;
++    bytesSinceLog += bytes;
++    time_t now = time(NULL);
++    if (now != lastLog) {
++        hardenedLog("P18: congestion drop frames=%u bytes=%u total=%u socket=%d; connection kept",
++                    framesSinceLog, bytesSinceLog, gP18DropFrames, socketNum);
++        lastLog = now;
++        framesSinceLog = 0;
++        bytesSinceLog = 0;
++    }
++}
++// ===== 加固(P18) 结束 =====
++
+ // ===== 加固(P13)：StreamReplicator 静默截断取证钩子（节流） =====
+ // liveMedia/StreamReplicator.cpp 的 copyReceivedFrame() 在目标副本缓冲小于
+ // 帧长时会把尾部字节丢掉（live555 原生行为，且 StreamParser 忽略
+@@ -203,11 +228,17 @@
+ }
+ 
+ static void healthCheckTask(void* /*clientData*/) {
+-    // 最终判据（v3，多轮取证后定稿）：客户端停读时 wlan0 出口立刻塌（TCP 窗口归零），
+-    // 而内核缓冲可吸收 10-15s、sink 可能停止拉帧 —— tx_queue/EAGAIN 打点均滞后或失效。
+-    // 故直接测 wlan0 出口速率：有客户端在播但出口 <15KB/s 连续 3 轮(3s) = 渗漏/塌陷态
+-    // （正常 118-147KB/s，静态低码率 ~25KB/s，渗漏态 ~7KB/s，真塌 <1KB/s）→ 拆除重建。
+-    // 3s 判定 + ~5s 重建 ≈ 8s 断流窗口，远短于 wd_stream strike4（20s）+killall 路径。
++    // 判据（P18 收紧，2026-11-08）：客户端停读时 wlan0 出口会塌（TCP 窗口归零），
++    // 历史上用「出口 <15KB/s 连续 3 轮」判定渗漏/塌陷态并拆除重建。
++    // 但现场反证：静态画面正常码率就只有 13.8KB/s（11:39:22 UTC 日志
++    // "egress 13806 B/s with 1 client(s); tearing down sessions"），
++    // 该阈值把「完全正常的静态低码率」误判成楔死，主动拆链并引发
++    // go2rtc 重连 / Frigate watchdog 重启 / 录像短秒级断流。
++    // P18 把巡检降级为「只兜真死连接」：
++    //   * 出口 <1KB/s（真塌，不是静态低码率）
++    //   * 连续 15 轮（15s，而不是 3s 的瞬时抖动）
++    //   * 拆除冷却 60s（避免把多个窗口拼成长断流）
++    // 常规拥塞已由 P11/P18 输出队列丢帧吸收，不再靠拆会话恢复。
+     static unsigned lastTx = 0;
+     static int lowRounds = 0;
+     if (g_rtspServer == NULL || g_smsHigh == NULL) { scheduleHealthCheck(); return; }
+@@ -227,15 +258,15 @@
+         }
+         if (lastTx != 0 && tx >= lastTx) {
+             unsigned delta = tx - lastTx; // 1s 内 wlan0 出口字节
+-            if (delta < 15 * 1024) {
++            if (delta < 1 * 1024) {          // P18: 15KB/s -> 1KB/s，只兜真塌
+                 lowRounds++;
+                 // 拆除冷却：密集渗漏时段重建出的新会话可能立刻又渗漏，
+                 // 连拆会把多个 8-10s 窗口拼成 20-40s 的长断流（15:06 CST 实测）。
+-                // 拆除后 20s 内不再拆，给新会话建立与客户端 probe 留时间。
+-                if (lowRounds >= 3) {
++                // P18 把冷却从 20s 放宽到 60s，进一步降低误拆概率。
++                if (lowRounds >= 15) {       // P18: 3 轮 -> 15 轮
+                     static time_t lastTeardown = 0;
+                     time_t nowSec = time(NULL);
+-                    if (lastTeardown != 0 && nowSec - lastTeardown < 20) {
++                    if (lastTeardown != 0 && nowSec - lastTeardown < 60) {
+                         hardenedLog("egress %u B/s but cooldown active; skipping teardown", delta);
+                         lowRounds = 2; // 保持待命，冷却期一过即可再拆
+                     } else {
+@@ -740,7 +771,7 @@
+     /* gRTPSendErrorHook = rtpSendErrorHook; */
+ 
+     // 加固(P4v2)：启动 FIFO 无消费巡检
+-    hardenedLog("hardened rRTSPServer starting (P1/P2/P3/P4/P4v2/P5/P6/P7/P9/P11/P12/P13), pid=%d, sigpipe=ignored", getpid());
++    hardenedLog("hardened rRTSPServer starting (P1/P2/P3/P4/P4v2/P5/P6/P7/P9/P11/P11a/P12/P13/P18), pid=%d, sigpipe=ignored", getpid());
+     scheduleHealthCheck();
+ 
+     env->taskScheduler().doEventLoop(); // does not return

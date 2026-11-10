@@ -1,0 +1,33 @@
+--- a/liveMedia/MultiFramedRTPSink.cpp
++++ b/liveMedia/MultiFramedRTPSink.cpp
+@@ -22,6 +22,11 @@
+ #include "MultiFramedRTPSink.hh"
+ #include "GroupsockHelper.hh"
+ 
++// 加固(P4a)：全局发送失败钩子。RTSP 服务端流媒体从不注册 onSendErrorFunc，
++// 导致 TCP 发送失败被静默吞掉（rRTSPServer 塌陷根因）。应用层可设置本钩子
++// 在失败时做 fail-fast 处理（如拆除楔死会话）。
++void (*gRTPSendErrorHook)(void) = NULL;
++
+ ////////// MultiFramedRTPSink //////////
+ 
+ void MultiFramedRTPSink::setPacketSizes(unsigned preferredPacketSize,
+@@ -387,14 +392,18 @@
+ 	if (fCrypto->processOutgoingSRTPPacket(packet, fOutBuf->curPacketSize(), newPacketSize)) {
+ 	  if (!fRTPInterface.sendPacket(packet, newPacketSize)) {
+ 	    // if failure handler has been specified, call it
++	    extern void rtpSendFailNotify(void); rtpSendFailNotify(); // 加固(P4v2)：失败打点
+ 	    if (fOnSendErrorFunc != NULL) (*fOnSendErrorFunc)(fOnSendErrorData);
++	    else if (gRTPSendErrorHook != NULL) gRTPSendErrorHook(); // 加固(P4a)
+ 	  }
+ 	}
+ #endif
+       } else { // unencrypted
+ 	if (!fRTPInterface.sendPacket(fOutBuf->packet(), fOutBuf->curPacketSize())) {
+ 	  // if failure handler has been specified, call it
++	  extern void rtpSendFailNotify(void); rtpSendFailNotify(); // 加固(P4v2)：失败打点
+ 	  if (fOnSendErrorFunc != NULL) (*fOnSendErrorFunc)(fOnSendErrorData);
++	  else if (gRTPSendErrorHook != NULL) gRTPSendErrorHook(); // 加固(P4a)
+ 	}
+       }
+     ++fPacketCount;

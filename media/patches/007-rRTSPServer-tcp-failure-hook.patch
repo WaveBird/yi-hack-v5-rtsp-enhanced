@@ -1,0 +1,28 @@
+--- a/src/rRTSPServer.cpp
++++ b/src/rRTSPServer.cpp
+@@ -115,6 +115,16 @@
+     struct timeval tv; gettimeofday(&tv, NULL);
+     return (u_int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+ }
++
++// ===== 加固(P5)：live555 TCP 发送失败根因钩子 =====
++// liveMedia/RTPInterface.cpp 在阻塞重试失败 / 硬错误时调用。真正的动作（shutdown
++// 干净断链）在库侧完成，这里只做低频取证；与 P4v2 的出口速率巡检相互独立，
++// P5 命中后会话会被正常删除，referenceCount 归零，P4v2 自然不会再拆一次。
++extern "C" void rrtspTcpFailureNotify(int socketNum, int reason, unsigned sendResult) {
++    hardenedLog("P5: tcp send failure socket=%d reason=%d sendResult=%u; forcing clean disconnect",
++                socketNum, reason, sendResult);
++}
++// ===== 加固(P5) 结束 =====
+ 
+ #define VIDEO_STALL_TEARDOWN_MS 4000    // 连续 4 轮(4s)都出现新的发送失败即判楔死
+                                         // （取证证实：楔死时 FIFO 仍被读取、帧被拉出后发送失败丢弃，
+@@ -666,7 +676,7 @@
+     /* gRTPSendErrorHook = rtpSendErrorHook; */
+ 
+     // 加固(P4v2)：启动 FIFO 无消费巡检
+-    hardenedLog("hardened rRTSPServer starting (P1/P2/P3/P4/P4v2), pid=%d, sigpipe=ignored", getpid());
++    hardenedLog("hardened rRTSPServer starting (P1/P2/P3/P4/P4v2/P5/P6), pid=%d, sigpipe=ignored", getpid());
+     scheduleHealthCheck();
+ 
+     env->taskScheduler().doEventLoop(); // does not return
