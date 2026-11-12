@@ -22,7 +22,9 @@ prebuilt/*
 !prebuilt/rRTSPServer.*
 !prebuilt/rmm_venc_stub.so
 !prebuilt/CHECKSUMS
+!prebuilt/README.md
 !prebuilt/CHECKSUMS
+!prebuilt/README.md
 media/live/
 media/build/
 media/_install/
