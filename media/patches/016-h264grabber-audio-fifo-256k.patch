@@ -1,0 +1,22 @@
+--- a/src/h264grabber/h264grabber/h264grabber.c
++++ b/src/h264grabber/h264grabber/h264grabber.c
+@@ -574,7 +574,18 @@
+                 fprintf(stderr, "Error opening fifo %s\n", FIFO_NAME_AAC);
+                 return -1;
+             }
+-            if (fcntl(fileno(fOut), F_SETPIPE_SZ, 8192) != 8192) {
++            // ===== 修复(P19b/AAC-T)：AAC FIFO 管道缓冲 8KB → 256KB =====
++            // 背景：塌陷（Wi-Fi 出口饱和 5-15s）期间 rRTSPServer 被 TCP 背压阻塞，
++            // 读 aac fifo 变慢；原 8192 字节管道缓冲在音频码率(~25-30KB/s)下
++            // 仅容纳 0.27 秒 → 瞬间写满 → grabber 的 write 阻塞 → /tmp/view 音频表
++            // 被环形覆盖 → 旧音频帧永久丢失，表现为录像分段音频尾部缺失
++            // （SHORT 段，坏率随时段 1~35%）。
++            // 对比：high fifo 已是 262144(256KB ≈ 8.5s)，视频在同样塌陷下不丢帧。
++            // 256KB ≈ 8.5s 音频，叠加 /tmp/view 音频环形表(~300帧 ≈ 8s)后，
++            // 两级缓冲覆盖塌陷全程(实测最长 15s)，音频零丢失。
++            // 现场验证：2026-11-12 17:02 塌陷 5s，drops=0（修复前同类塌陷必丢帧）。
++#define AUDIO_FIFO_BYTES 262144
++            if (fcntl(fileno(fOut), F_SETPIPE_SZ, AUDIO_FIFO_BYTES) != AUDIO_FIFO_BYTES) {
+                 fprintf(stderr, "Cannot set size of fifo\n");
+                 return -1;
+             };

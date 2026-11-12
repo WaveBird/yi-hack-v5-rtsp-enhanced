@@ -4,6 +4,7 @@
 
 - [x] 仓库骨架、GPL-3.0
 - [x] 16 个补丁迁入 `media/patches/`
+- [x] 17 个补丁（新增 016-audio-fifo-256k：塌陷期音频零丢失，2026-11-12 实战验证）
 - [x] 文档：FINDINGS / ARCHITECTURE / MEASUREMENT / LEGAL / COMPATIBILITY / PLAN
 - [ ] `verify/` 22 只工具迁入 + 去个人化
 - [ ] `deploy/install.sh` 支持 profile 与自动备份
