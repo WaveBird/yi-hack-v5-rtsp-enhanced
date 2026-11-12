@@ -18,6 +18,10 @@ home_*
 # 构建产物（release 时用附件分发，不强制入库）
 # ─────────────────────────────────────────────────────────────
 prebuilt/*
+!prebuilt/h264grabber.*
+!prebuilt/rRTSPServer.*
+!prebuilt/rmm_venc_stub.so
+!prebuilt/CHECKSUMS
 !prebuilt/CHECKSUMS
 media/live/
 media/build/
